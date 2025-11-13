@@ -9954,3 +9954,1446 @@ Speedup: 3,333× faster
 **Next:** String internals with Simple Dynamic Strings (SDS)
 
 ---
+## Chapter 25: String Internals - Simple Dynamic Strings (SDS)
+
+### Why Not C Strings?
+
+Redis doesn't use standard C strings (`char*`) due to several limitations:
+
+#### Problem 1: O(N) Length Calculation
+
+```c
+// C string
+char *str = "hello";
+
+// Get length
+size_t len = strlen(str);  // O(N) - scans until '\0'
+```
+
+**For Redis:**
+- Millions of string operations per second
+- Repeated `strlen()` calls = wasted CPU cycles
+
+---
+
+#### Problem 2: Inefficient Appends
+
+```c
+// Append to C string
+char *str = "hello";
+char *new_str = malloc(strlen(str) + 6);  // Realloc every time
+strcpy(new_str, str);
+strcat(new_str, "world");
+free(str);
+str = new_str;
+```
+
+**Problems:**
+- `malloc()` + `free()` on every append
+- No pre-allocation strategy
+- Memory fragmentation
+
+---
+
+#### Problem 3: Not Binary-Safe
+
+```c
+// C string
+char str[] = "hello\0world";
+
+printf("%s", str);  // Output: "hello"
+                    // Lost "world" after null byte!
+```
+
+**Redis needs:**
+- Store arbitrary bytes (serialized objects, images)
+- Support embedded `\0` characters
+
+---
+
+### Solution: Simple Dynamic Strings (SDS)
+
+**SDS** is Redis's custom string implementation with O(1) length, efficient appends, and binary safety.
+
+#### Basic Structure
+
+```c
+struct sdshdr8 {
+    uint8_t len;        // Current string length
+    uint8_t alloc;      // Allocated capacity
+    unsigned char flags; // Type of header
+    char buf[];         // String data (flexible array member)
+};
+```
+
+---
+
+### SDS Header Types
+
+Redis uses **different header sizes** based on string length to save memory:
+
+```c
+// For strings < 32 bytes
+struct __attribute__((__packed__)) sdshdr5 {
+    unsigned char flags; // 3 bits type, 5 bits length
+    char buf[];
+};
+
+// For strings < 256 bytes
+struct __attribute__((__packed__)) sdshdr8 {
+    uint8_t len;        // 1 byte
+    uint8_t alloc;      // 1 byte
+    unsigned char flags; // 1 byte
+    char buf[];
+};
+
+// For strings < 64KB
+struct __attribute__((__packed__)) sdshdr16 {
+    uint16_t len;       // 2 bytes
+    uint16_t alloc;     // 2 bytes
+    unsigned char flags; // 1 byte
+    char buf[];
+};
+
+// For strings < 4GB
+struct __attribute__((__packed__)) sdshdr32 {
+    uint32_t len;       // 4 bytes
+    uint32_t alloc;     // 4 bytes
+    unsigned char flags; // 1 byte
+    char buf[];
+};
+
+// For huge strings
+struct __attribute__((__packed__)) sdshdr64 {
+    uint64_t len;       // 8 bytes
+    uint64_t alloc;     // 8 bytes
+    unsigned char flags; // 1 byte
+    char buf[];
+};
+```
+
+**Header Type Selection:**
+
+| String Length | Header Type | Overhead |
+|--------------|-------------|----------|
+| < 32 bytes | sdshdr5 | 1 byte |
+| < 256 bytes | sdshdr8 | 3 bytes |
+| < 64KB | sdshdr16 | 5 bytes |
+| < 4GB | sdshdr32 | 9 bytes |
+| ≥ 4GB | sdshdr64 | 17 bytes |
+
+---
+
+### SDS Memory Layout
+
+**Example: "hello" (5 bytes)**
+
+```
+┌──────────────────────────────────────┐
+│ sdshdr8 (using 8-bit header)         │
+├──────────────────────────────────────┤
+│ len:   5          (1 byte)           │
+│ alloc: 10         (1 byte)           │
+│ flags: SDS_TYPE_8 (1 byte)           │
+│ buf:   ['h','e','l','l','o','\0',...] │
+│        └───────┬───────┘               │
+│                └─ Null-terminated     │
+│                   for C compatibility │
+└──────────────────────────────────────┘
+
+Total: 3 bytes (header) + 6 bytes (data) = 9 bytes
+       (vs 6 bytes for C string, but with O(1) length)
+```
+
+---
+
+### SDS Operations
+
+#### 1. Create New SDS
+
+```c
+sds sdsnewlen(const void *init, size_t initlen) {
+    void *sh;
+    sds s;
+    char type = sdsReqType(initlen);  // Determine header type
+
+    // Allocate header + string + null terminator
+    int hdrlen = sdsHdrSize(type);
+    sh = zmalloc(hdrlen + initlen + 1);
+
+    // Initialize header
+    s = (char*)sh + hdrlen;
+    switch (type) {
+        case SDS_TYPE_8: {
+            SDS_HDR_VAR(8, s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            break;
+        }
+        // ... other types
+    }
+
+    // Copy data
+    if (initlen && init)
+        memcpy(s, init, initlen);
+    s[initlen] = '\0';  // Null terminate
+
+    return s;
+}
+```
+
+**Pointer Trick:**
+
+```
+Allocated Memory:
+┌──────────┬────────────┐
+│ Header   │ String buf │
+└──────────┴────────────┘
+           ▲
+           └─ s points here (not to header!)
+```
+
+**Why?** SDS can be passed to C functions expecting `char*`
+
+---
+
+#### 2. Get Length (O(1))
+
+```c
+size_t sdslen(const sds s) {
+    unsigned char flags = s[-1];  // Read flags byte before s
+    switch (flags & SDS_TYPE_MASK) {
+        case SDS_TYPE_8:
+            return SDS_HDR(8, s)->len;
+        case SDS_TYPE_16:
+            return SDS_HDR(16, s)->len;
+        // ... other types
+    }
+}
+```
+
+**Memory Access:**
+
+```
+s points to buf:
+          s[-1]    s[0]
+            │       │
+            ▼       ▼
+┌──┬──┬──┬──┬───┬───┬───┬───┬───┬───┐
+│..│..│..│fl│'h'│'e'│'l'│'l'│'o'│'\0'│
+└──┴──┴──┴──┴───┴───┴───┴───┴───┴───┘
+          ▲
+          └─ flags (header type encoded)
+```
+
+**Comparison:**
+
+```
+C string:    strlen(s)  → O(N)
+SDS:         sdslen(s)  → O(1)
+```
+
+---
+
+#### 3. Append (Efficient)
+
+```c
+sds sdscatlen(sds s, const void *t, size_t len) {
+    size_t curlen = sdslen(s);
+
+    // Make room (may realloc)
+    s = sdsMakeRoomFor(s, len);
+
+    // Copy new data
+    memcpy(s + curlen, t, len);
+
+    // Update length
+    sdssetlen(s, curlen + len);
+    s[curlen + len] = '\0';
+
+    return s;
+}
+```
+
+**Smart Reallocation:**
+
+```c
+sds sdsMakeRoomFor(sds s, size_t addlen) {
+    size_t len = sdslen(s);
+    size_t newlen = len + addlen;
+
+    // Pre-allocate extra space
+    if (newlen < SDS_MAX_PREALLOC) {
+        newlen *= 2;  // Double capacity
+    } else {
+        newlen += SDS_MAX_PREALLOC;  // Add 1MB
+    }
+
+    // Realloc if needed
+    if (sdsavail(s) < addlen) {
+        s = sdsRealloc(s, newlen);
+    }
+
+    return s;
+}
+```
+
+**Growth Strategy:**
+
+```
+Initial: "hello" (len=5, alloc=5)
+Append "world": Need 5 more bytes
+  → Allocate 20 bytes (5+5)*2
+  → Actual usage: 10 bytes
+  → Free space: 10 bytes
+
+Next append: If ≤10 bytes, no realloc needed!
+```
+
+---
+
+### Redis Object Encodings for Strings
+
+Redis chooses encoding based on value:
+
+```c
+robj *tryObjectEncoding(robj *o) {
+    sds s = o->ptr;
+
+    // 1. Try integer encoding
+    long value;
+    if (string2l(s, sdslen(s), &value)) {
+        // Value is integer
+        if (value >= 0 && value < OBJ_SHARED_INTEGERS) {
+            // Use shared integer object
+            decrRefCount(o);
+            return shared.integers[value];
+        } else {
+            // Create integer-encoded object
+            o->encoding = OBJ_ENCODING_INT;
+            o->ptr = (void*)value;
+            sdsfree(s);
+        }
+        return o;
+    }
+
+    // 2. Try EMBSTR encoding
+    if (sdslen(s) <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+        robj *emb = createEmbeddedStringObject(s, sdslen(s));
+        decrRefCount(o);
+        return emb;
+    }
+
+    // 3. Default: RAW encoding (already using SDS)
+    trimStringObjectIfNeeded(o);
+    return o;
+}
+```
+
+---
+
+#### OBJ_ENCODING_INT
+
+**Store integer as pointer:**
+
+```c
+robj *createStringObjectFromLongLong(long long value) {
+    robj *o = createObject(OBJ_STRING, NULL);
+    o->encoding = OBJ_ENCODING_INT;
+    o->ptr = (void*)value;  // No SDS allocated!
+    return o;
+}
+```
+
+**Memory:**
+
+```
+For "42":
+┌──────────────────┐
+│ redisObject      │
+│ - type: STRING   │
+│ - encoding: INT  │
+│ - ptr: 42        │  ← Integer stored directly
+└──────────────────┘
+
+Total: 16 bytes (just the object)
+```
+
+---
+
+#### OBJ_ENCODING_EMBSTR
+
+**Embed SDS in object:**
+
+```c
+robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    // Allocate object + SDS header + data in one block
+    robj *o = zmalloc(sizeof(robj) + sizeof(struct sdshdr8) + len + 1);
+
+    // Setup SDS
+    struct sdshdr8 *sh = (void*)(o + 1);
+    sh->len = len;
+    sh->alloc = len;
+    sh->flags = SDS_TYPE_8;
+
+    // Setup object
+    o->type = OBJ_STRING;
+    o->encoding = OBJ_ENCODING_EMBSTR;
+    o->ptr = sh->buf;
+
+    // Copy data
+    memcpy(sh->buf, ptr, len);
+    sh->buf[len] = '\0';
+
+    return o;
+}
+```
+
+**Memory Layout:**
+
+```
+For "hello" (5 bytes):
+┌─────────────────────────────────────────┐
+│ Single allocation (64 bytes)            │
+├─────────────────────────────────────────┤
+│ redisObject (16 bytes)                  │
+│ ├─ type: STRING                         │
+│ ├─ encoding: EMBSTR                     │
+│ └─ ptr ──┐                              │
+├──────────┼──────────────────────────────┤
+│ sdshdr8  │(3 bytes)                     │
+│ ├─ len: 5│                              │
+│ ├─ alloc:│5                             │
+│ └─ flags:│SDS_TYPE_8                    │
+├──────────┼──────────────────────────────┤
+│ buf <────┘                              │
+│ ['h','e','l','l','o','\0']              │
+└─────────────────────────────────────────┘
+
+Total: 16 + 3 + 6 = 25 bytes
+Fits in 64-byte allocation (Redis minimum)
+```
+
+**Why 44 bytes limit?**
+
+```
+64 bytes (allocation)
+- 16 bytes (redisObject)
+- 3 bytes (sdshdr8)
+- 1 byte (null terminator)
+= 44 bytes available for string
+```
+
+---
+
+#### OBJ_ENCODING_RAW
+
+**Separate SDS allocation:**
+
+```c
+robj *createStringObject(const char *ptr, size_t len) {
+    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+        return createEmbeddedStringObject(ptr, len);
+    }
+    return createRawStringObject(ptr, len);
+}
+
+robj *createRawStringObject(const char *ptr, size_t len) {
+    return createObject(OBJ_STRING, sdsnewlen(ptr, len));
+}
+```
+
+**Memory Layout:**
+
+```
+For "Long string..." (100 bytes):
+
+┌──────────────────┐
+│ redisObject      │
+│ - type: STRING   │
+│ - encoding: RAW  │
+│ - ptr ────────┐  │
+└───────────────┼──┘
+                │
+                ↓
+        ┌───────────────────┐
+        │ SDS (separate)    │
+        │ - len: 100        │
+        │ - alloc: 200      │
+        │ - buf: [data...]  │
+        └───────────────────┘
+
+Total: 16 + (3 + 101) = 120 bytes
+```
+
+---
+
+### Performance Comparison
+
+**Append Benchmark:**
+
+```c
+// C string (naive)
+char *str = malloc(6);
+strcpy(str, "hello");
+
+for (int i = 0; i < 10000; i++) {
+    size_t len = strlen(str);
+    str = realloc(str, len + 6);
+    strcat(str, "world");
+}
+// Time: ~50ms (10,000 reallocs)
+
+// SDS (smart)
+sds s = sdsnew("hello");
+
+for (int i = 0; i < 10000; i++) {
+    s = sdscat(s, "world");
+}
+// Time: ~2ms (~20 reallocs due to pre-allocation)
+
+Speedup: 25×
+```
+
+---
+
+### Binary Safety Example
+
+```c
+// C string (fails)
+char binary[] = "hello\0world";
+printf("%zu", strlen(binary));  // Output: 5 (stops at \0)
+
+// SDS (works)
+sds s = sdsnewlen("hello\0world", 11);
+printf("%zu", sdslen(s));  // Output: 11 (correct)
+
+// Can store any bytes
+unsigned char image_data[] = {0xFF, 0xD8, 0xFF, 0xE0, ...};
+sds image_sds = sdsnewlen(image_data, sizeof(image_data));
+```
+
+---
+
+### Summary
+
+**SDS vs C Strings:**
+
+| Feature | C String | SDS |
+|---------|----------|-----|
+| **Length lookup** | O(N) | O(1) |
+| **Append** | O(N) reallocations | O(1) amortized |
+| **Binary safe** | ❌ No (stops at \0) | ✅ Yes |
+| **Memory overhead** | 0 bytes | 1-17 bytes (header) |
+| **Pre-allocation** | ❌ No | ✅ Yes |
+| **C compatible** | ✅ Native | ✅ buf is null-terminated |
+
+**Encoding Strategy:**
+
+```
+Value Type       Encoding       Memory
+----------       --------       ------
+Integer          INT            16 bytes
+String ≤44B      EMBSTR         ~25-60 bytes
+String >44B      RAW            16 + SDS size
+```
+
+**Design Philosophy:**
+- **Optimize common case** (small strings, appends)
+- **Pay for what you use** (different header sizes)
+- **Backward compatible** (works with C APIs)
+
+**Next:** HyperLogLog for cardinality estimation
+
+---
+
+# Part 7: Advanced Algorithms
+
+## Chapter 26: HyperLogLog and Cardinality Estimation
+
+### The Cardinality Problem
+
+**Problem:** Count unique elements in a massive stream
+
+**Example Use Cases:**
+- Unique visitors to a website (millions/day)
+- Unique IP addresses in network traffic
+- Distinct words in documents
+- Unique users clicking an ad
+
+---
+
+### Naive Solutions
+
+#### 1. Hash Set
+
+```go
+uniqueUsers := make(map[string]bool)
+
+for event := range events {
+    uniqueUsers[event.UserID] = true
+}
+
+count := len(uniqueUsers)  // Exact count
+```
+
+**Memory:**
+- 1M unique users × 36 bytes/entry = 36 MB
+- 1B unique users × 36 bytes/entry = 36 GB ❌
+
+---
+
+#### 2. Bitmap
+
+```go
+bitmap := make([]byte, 1_000_000_000/8)  // 125 MB
+
+for event := range events {
+    hash := hashUserID(event.UserID)
+    setBit(bitmap, hash % 1_000_000_000)
+}
+
+count := countSetBits(bitmap)  // Approximate count
+```
+
+**Memory:** Fixed (125 MB for 1B possible IDs)
+**Accuracy:** Limited (hash collisions)
+
+---
+
+### HyperLogLog Solution
+
+**HyperLogLog (HLL)** provides approximate cardinality with:
+- **Fixed memory**: 12 KB (regardless of cardinality)
+- **Standard error**: ±0.81%
+- **Mergeable**: Combine multiple HLLs
+
+**Redis Commands:**
+
+```bash
+# Add elements
+127.0.0.1:6379> PFADD unique_visitors user1 user2 user3
+(integer) 1
+
+# Get count
+127.0.0.1:6379> PFCOUNT unique_visitors
+(integer) 3
+
+# Merge multiple HLLs
+127.0.0.1:6379> PFMERGE total hll1 hll2 hll3
+OK
+127.0.0.1:6379> PFCOUNT total
+(integer) 15234
+```
+
+---
+
+### Flajolet-Martin Algorithm
+
+**Core idea:** Use hash distribution properties to estimate cardinality
+
+#### Observation
+
+For uniformly distributed hash values (binary):
+
+```
+Probability of rightmost 1-bit at position k:
+
+P(position 0) = 1/2     (50%)     e.g., ...0001
+P(position 1) = 1/4     (25%)     e.g., ...0010
+P(position 2) = 1/8     (12.5%)   e.g., ...0100
+P(position k) = 1/2^(k+1)
+```
+
+**Intuition:** If we see rightmost bit at position 5, we've likely seen ~2^5 = 32 different hashes.
+
+---
+
+#### Algorithm
+
+**Step 1: Hash each element**
+
+```
+Element     Hash (binary)         Rightmost 1-bit position
+-------     -------------         ------------------------
+user1    →  ...10110100          →  2
+user2    →  ...01001000          →  3
+user3    →  ...10000001          →  0
+user4    →  ...00100000          →  5
+```
+
+**Step 2: Track maximum position**
+
+```
+max_position = max(2, 3, 0, 5) = 5
+```
+
+**Step 3: Estimate cardinality**
+
+```
+Estimate = 2^max_position = 2^5 = 32
+```
+
+---
+
+#### Example Walkthrough
+
+**Processing 8 elements:**
+
+```
+Elements: [A, B, C, D, E, F, G, H]
+
+Hash results (showing last 8 bits):
+A → 10110100  (rightmost 1 at position 2)
+B → 01001000  (rightmost 1 at position 3)
+C → 10010001  (rightmost 1 at position 0)
+D → 00100000  (rightmost 1 at position 5)
+E → 11000010  (rightmost 1 at position 1)
+F → 01110100  (rightmost 1 at position 2)
+G → 10001000  (rightmost 1 at position 3)
+H → 00010000  (rightmost 1 at position 4)
+
+Max position: 5
+Estimate: 2^5 = 32
+Actual: 8
+
+Error: 300% (very high for small samples!)
+```
+
+---
+
+### Improving Accuracy
+
+#### Problem 1: High Variance
+
+Single observation → high error
+
+**Solution: Stochastic Averaging**
+
+Divide hash space into **m buckets**, track max for each:
+
+```
+Hash → [bucket_index | remaining_bits]
+        (use first k bits for bucket selection)
+```
+
+**Algorithm:**
+
+```
+buckets[m]  // m = 2^k buckets
+
+for element in stream:
+    hash = hash(element)
+    bucket_index = hash >> (64 - k)  // First k bits
+    remaining = hash & ((1 << (64-k)) - 1)  // Last 64-k bits
+
+    position = rightmost_1_bit(remaining)
+    buckets[bucket_index] = max(buckets[bucket_index], position)
+
+// Harmonic mean of estimates
+estimate = m * 2^(average(buckets))
+```
+
+---
+
+#### Harmonic Mean
+
+**Why not arithmetic mean?**
+
+Arithmetic mean is skewed by outliers:
+```
+Buckets: [1, 1, 1, 10]
+Arithmetic mean: (2^1 + 2^1 + 2^1 + 2^10) / 4 = 258
+Actual: ~4
+
+Harmonic mean: 4 / (1/2 + 1/2 + 1/2 + 1/1024) ≈ 2.67
+Actual: ~4
+```
+
+**Formula:**
+
+```
+HarmonicMean(x1, x2, ..., xm) = m / (1/x1 + 1/x2 + ... + 1/xm)
+
+For HLL:
+Estimate = α_m * m * 2^(HarmonicMean(buckets))
+
+where α_m is a bias correction constant
+```
+
+---
+
+### HyperLogLog Refinements
+
+#### 1. Bias Correction
+
+```c
+double alpha_m(unsigned m) {
+    switch (m) {
+        case 16:  return 0.673;
+        case 32:  return 0.697;
+        case 64:  return 0.709;
+        default:  return 0.7213 / (1.0 + 1.079 / m);
+    }
+}
+```
+
+---
+
+#### 2. Small/Large Range Corrections
+
+```c
+double hllCount(uint8_t *registers, int m) {
+    double estimate = /* harmonic mean calculation */;
+
+    // Small range correction
+    if (estimate <= 2.5 * m) {
+        int zeros = count_zeros(registers, m);
+        if (zeros != 0) {
+            estimate = m * log((double)m / zeros);
+        }
+    }
+
+    // Large range correction (for 64-bit hashes)
+    if (estimate > (1.0/30.0) * (1ULL << 32)) {
+        estimate = -1 * (1ULL << 32) * log(1.0 - estimate / (1ULL << 32));
+    }
+
+    return estimate;
+}
+```
+
+---
+
+### Redis Implementation
+
+#### Storage Formats
+
+**Dense Representation:**
+
+```
+For m=16384 buckets, 6 bits per bucket:
+Memory = 16384 * 6 / 8 = 12 KB
+```
+
+**Sparse Representation (for small cardinalities):**
+
+```
+Encode runs of zeros and individual values:
+- Run of n zeros: encoded compactly
+- Non-zero value: encode position + value
+
+Switches to dense when sparse > 3KB
+```
+
+---
+
+#### PFADD Implementation
+
+```c
+int pfadd(robj *o, robj **argv, int argc) {
+    struct hllhdr *hdr = o->ptr;
+    int updated = 0;
+
+    for (int i = 0; i < argc; i++) {
+        uint64_t hash = MurmurHash64A(argv[i]->ptr, sdslen(argv[i]->ptr), 0);
+
+        // Extract bucket index (first 14 bits for 16384 buckets)
+        int index = hash & 0x3fff;
+
+        // Extract remaining 50 bits, count leading zeros + 1
+        hash >>= 14;
+        int count = __builtin_clzll(hash | (1ULL << 63)) + 1;
+
+        // Update bucket if new max
+        if (hllPatSet(hdr, index, count)) {
+            updated = 1;
+        }
+    }
+
+    return updated;
+}
+```
+
+---
+
+#### PFCOUNT Implementation
+
+```c
+uint64_t pfcount(robj *o) {
+    struct hllhdr *hdr = o->ptr;
+    double m = 16384.0;
+    double E = 0.0;
+
+    // Compute harmonic mean
+    for (int i = 0; i < 16384; i++) {
+        int val = hllPatGet(hdr, i);
+        E += 1.0 / pow(2.0, val);
+    }
+
+    // Calculate estimate
+    E = (1.0 / E) * m * m * 0.7213 / (1.0 + 1.079 / m);
+
+    // Apply corrections
+    if (E <= 2.5 * m) {
+        int zeros = countZeros(hdr);
+        if (zeros != 0) {
+            E = m * log(m / (double)zeros);
+        }
+    } else if (E > (1.0/30.0) * pow(2, 32)) {
+        E = -pow(2, 32) * log(1.0 - E / pow(2, 32));
+    }
+
+    return (uint64_t)E;
+}
+```
+
+---
+
+#### PFMERGE Implementation
+
+```c
+void pfmerge(robj *dest, robj **src, int count) {
+    struct hllhdr *dest_hdr = dest->ptr;
+
+    for (int i = 0; i < count; i++) {
+        struct hllhdr *src_hdr = src[i]->ptr;
+
+        // Merge: take maximum register value for each bucket
+        for (int j = 0; j < 16384; j++) {
+            int src_val = hllPatGet(src_hdr, j);
+            int dest_val = hllPatGet(dest_hdr, j);
+
+            if (src_val > dest_val) {
+                hllPatSet(dest_hdr, j, src_val);
+            }
+        }
+    }
+}
+```
+
+---
+
+### Accuracy Analysis
+
+**Standard Error:**
+
+```
+σ = 1.04 / sqrt(m)
+
+For m=16384:
+σ = 1.04 / sqrt(16384) = 1.04 / 128 ≈ 0.81%
+```
+
+**Practical Results:**
+
+```bash
+# Test with known cardinality
+for i in {1..1000000}; do
+    echo "user_$i"
+done | redis-cli --pipe PFADD unique_users
+
+# Check estimate
+PFCOUNT unique_users
+# 1001234  (actual: 1000000, error: 0.12%)
+```
+
+**Error Distribution:**
+
+```
+Test 1000 trials:
+Mean error: 0.81%
+Std dev: 0.81%
+99th percentile: 2.5%
+```
+
+---
+
+### Use Cases
+
+**1. Unique Visitors (per page)**
+
+```bash
+# Track daily visitors
+PFADD visitors:homepage:2024-01-15 user1 user2 ...
+PFADD visitors:about:2024-01-15 user3 user4 ...
+
+# Get counts
+PFCOUNT visitors:homepage:2024-01-15
+PFCOUNT visitors:about:2024-01-15
+
+# Total unique across pages
+PFMERGE visitors:all:2024-01-15 \
+    visitors:homepage:2024-01-15 \
+    visitors:about:2024-01-15
+
+PFCOUNT visitors:all:2024-01-15
+```
+
+**Memory:** 12 KB per page per day (vs GB for exact sets)
+
+---
+
+**2. IP Address Deduplication**
+
+```bash
+# Track unique IPs per hour
+PFADD ips:2024-01-15:00 192.168.1.1 192.168.1.2 ...
+PFADD ips:2024-01-15:01 192.168.1.3 192.168.1.1 ...
+
+# Daily unique IPs
+PFMERGE ips:2024-01-15 ips:2024-01-15:00 ips:2024-01-15:01 ... ips:2024-01-15:23
+PFCOUNT ips:2024-01-15
+```
+
+---
+
+### Summary
+
+**HyperLogLog:**
+- ✅ **Memory**: Fixed 12 KB (up to ~10^9 elements)
+- ✅ **Accuracy**: ±0.81% standard error
+- ✅ **Mergeable**: Union of multiple HLLs
+- ✅ **Fast**: O(1) add, O(m) count (m=16384)
+
+**Trade-offs:**
+- ⚠️ Approximate (not exact)
+- ⚠️ Insert-only (can't remove elements)
+- ⚠️ Can't list elements
+
+**When to Use:**
+- ✅ Counting unique items at scale
+- ✅ Memory is constrained
+- ✅ Approximate counts acceptable
+- ❌ Need exact counts or element listing
+
+**Next:** LFU eviction with approximate counting
+
+---
+
+## Chapter 27: LFU and Approximate Counting
+
+### LFU Eviction Strategy
+
+**LFU (Least Frequently Used)** evicts keys accessed the fewest times, regardless of recency.
+
+**LRU vs LFU:**
+
+```
+Scenario: Keys A, B, C
+
+LRU Timeline:
+t=0: Access A
+t=1: Access B
+t=2: Access C
+t=3: Evict? → A (least recent)
+
+LFU Timeline:
+t=0-10: Access A (100 times)
+t=11: Access B (1 time)
+t=12: Access C (1 time)
+t=13: Evict? → B or C (least frequent)
+```
+
+**When LFU is Better:**
+- Hot keys exist (repeatedly accessed)
+- Burst access patterns (LRU would evict hot key after burst)
+
+---
+
+### The Frequency Counting Problem
+
+**Naive Approach:**
+
+```go
+type Object struct {
+    Value       interface{}
+    AccessCount int64  // 8 bytes per object!
+}
+
+func onAccess(obj *Object) {
+    obj.AccessCount++  // No upper bound
+}
+```
+
+**Problems:**
+1. **8 bytes overhead** per object (millions of keys = MB wasted)
+2. **No decay**: Old hot keys stay hot forever
+3. **Overflow risk**: Counters grow indefinitely
+
+---
+
+### Redis LFU Design
+
+**Uses same 24 bits as LRU:**
+
+```c
+struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:24;  // ← Reused for LFU!
+    // ...
+};
+```
+
+**LFU Bit Layout:**
+
+```
+24 bits total:
+┌──────────────────┬──────────────┐
+│ Last Decay Time  │ Log Counter  │
+│    (16 bits)     │   (8 bits)   │
+└──────────────────┴──────────────┘
+```
+
+**Fields:**
+- **Last Decay Time (16 bits)**: Unix minutes (mod 2^16)
+- **Log Counter (8 bits)**: Logarithmic access frequency
+
+---
+
+### Morris Counter
+
+**Problem:** Store large counts in small space (8 bits)
+
+**Solution:** Store log of count, not count itself
+
+#### Algorithm
+
+```
+Instead of storing N, store V where:
+    N ≈ 2^V - 1
+
+Example:
+    N=1     → V=1   (2^1-1 = 1)
+    N=3     → V=2   (2^2-1 = 3)
+    N=7     → V=3   (2^3-1 = 7)
+    N=255   → V=8   (2^8-1 = 255)
+    N=65535 → V=16  (but we only have 8 bits!)
+```
+
+---
+
+#### Probabilistic Increment
+
+**Challenge:** Can't increment V on every access (saturates too quickly)
+
+**Solution:** Increment with probability inversely proportional to current count
+
+```
+Current V → Estimated N
+Probability of incrementing V = 1 / (N(V+1) - N(V))
+
+where N(V) = 2^V - 1
+```
+
+**Example:**
+
+```
+V=3, N≈7:
+- N(3) = 7
+- N(4) = 15
+- Increment probability = 1/(15-7) = 1/8 = 12.5%
+
+V=8, N≈255:
+- N(8) = 255
+- N(9) = 511
+- Increment probability = 1/(511-255) = 1/256 = 0.39%
+```
+
+**Result:** Higher counts increment less frequently
+
+---
+
+#### Implementation
+
+```c
+uint8_t LFULogIncr(uint8_t counter) {
+    if (counter == 255) return 255;  // Saturated
+
+    double r = (double)rand() / RAND_MAX;
+    double baseval = counter - LFU_INIT_VAL;
+
+    if (baseval < 0) baseval = 0;
+
+    double p = 1.0 / (baseval * server.lfu_log_factor + 1);
+
+    if (r < p) {
+        counter++;
+    }
+
+    return counter;
+}
+```
+
+**`lfu_log_factor`** controls growth rate:
+- Higher factor → slower growth → more precision for small counts
+- Default: 10
+
+---
+
+### Time-Based Decay
+
+**Problem:** Old hot keys shouldn't stay hot forever
+
+**Solution:** Decay counter over time
+
+#### Last Decay Time (16 bits)
+
+**Store Unix minutes mod 2^16:**
+
+```c
+unsigned long LFUGetTimeInMinutes(void) {
+    return (server.unixtime / 60) & 65535;  // Wrap at 2^16
+}
+```
+
+**Range:** 0 to 65535 minutes ≈ 45 days
+
+---
+
+#### Decay Logic
+
+**On every access:**
+
+```c
+unsigned long LFUDecrAndReturn(robj *o) {
+    unsigned long ldt = o->lru >> 8;  // Extract last decay time (16 bits)
+    unsigned long counter = o->lru & 255;  // Extract counter (8 bits)
+
+    unsigned long now = LFUGetTimeInMinutes();
+    unsigned long elapsed;
+
+    // Handle wraparound
+    if (now >= ldt) {
+        elapsed = now - ldt;
+    } else {
+        elapsed = 65535 - ldt + now;
+    }
+
+    // Decay: 1 decrement per decay_time minutes
+    unsigned long num_periods = elapsed / server.lfu_decay_time;
+
+    if (num_periods) {
+        counter = (num_periods > counter) ? 0 : counter - num_periods;
+    }
+
+    return counter;
+}
+```
+
+**Configuration:**
+
+```bash
+# redis.conf
+lfu-decay-time 1  # Decay every 1 minute
+```
+
+---
+
+#### Update on Access
+
+```c
+void updateLFU(robj *val) {
+    unsigned long counter = LFUDecrAndReturn(val);  // Decay first
+    counter = LFULogIncr(counter);                   // Then increment
+
+    unsigned long now = LFUGetTimeInMinutes();
+    val->lru = (now << 8) | counter;  // Reconstruct 24 bits
+}
+```
+
+**Flow:**
+
+```
+Before access (t=100):
+┌──────┬────────┐
+│ 100  │  50    │  (last access: 100 min ago, counter: 50)
+└──────┴────────┘
+
+Access at t=105 (5 minutes later, lfu_decay_time=1):
+1. Decay: 50 - 5 = 45
+2. Increment: 45 → 46 (probabilistic)
+3. Update time: 105
+
+After access:
+┌──────┬────────┐
+│ 105  │  46    │
+└──────┴────────┘
+```
+
+---
+
+### Saturation at 1 Million
+
+**Counter saturates at 255:**
+
+```
+V=255 → N ≈ 2^255 - 1 (huge!)
+
+But in practice, Redis limits to:
+N ≈ 1,000,000 accesses
+```
+
+**Why?** Beyond 1M, precision doesn't matter for eviction decisions.
+
+---
+
+### LFU Eviction Process
+
+**Same pool-based approach as LRU:**
+
+```c
+void evictionPoolPopulate(/* ... */) {
+    // Sample random keys
+    for (int i = 0; i < sample_size; i++) {
+        robj *o = dictGetRandomKey(dict);
+
+        // Get idle time (inverse of frequency)
+        unsigned long idle = 255 - LFUDecrAndReturn(o);
+
+        // Add to eviction pool
+        evictionPoolAdd(pool, key, idle);
+    }
+}
+```
+
+**Idle Time Calculation:**
+
+```
+High frequency → Low idle time → Less likely to evict
+Low frequency  → High idle time → More likely to evict
+```
+
+---
+
+### Configuration
+
+```bash
+# redis.conf
+
+# Eviction policy
+maxmemory-policy allkeys-lfu  # or volatile-lfu
+
+# LFU tuning
+lfu-log-factor 10      # Higher = slower counter growth
+lfu-decay-time 1       # Minutes per decay tick
+```
+
+**Tuning Guidelines:**
+
+| Workload | log_factor | decay_time |
+|----------|-----------|------------|
+| High traffic (millions hits/day) | 10 (default) | 1 (default) |
+| Low traffic (thousands hits/day) | 5 | 5 |
+| Long-term trending | 10 | 60 |
+| Short-term bursts | 20 | 1 |
+
+---
+
+### Performance Analysis
+
+**Memory:**
+
+```
+Per object:
+- LRU: 24 bits (3 bytes)
+- LFU: 24 bits (3 bytes)  ← Same!
+
+No additional overhead
+```
+
+**CPU:**
+
+```
+Per access:
+- Decay calculation: ~10ns
+- Probabilistic increment: ~20ns (includes random())
+- Total: ~30ns
+
+Negligible compared to command execution (microseconds)
+```
+
+---
+
+### LRU vs LFU Comparison
+
+**Test Scenario:**
+
+```
+Keys:
+- hotkey: Accessed 1000 times at t=0-10
+- burst1: Accessed 100 times at t=100
+- burst2: Accessed 100 times at t=101
+- newkey: Accessed 1 time at t=102
+
+Memory full, need to evict at t=103
+```
+
+**LRU Decision:**
+
+```
+Last Access Times:
+- hotkey: t=10  (oldest)
+- burst1: t=100
+- burst2: t=101
+- newkey: t=102 (newest)
+
+Evict: hotkey (despite being most accessed overall)
+```
+
+**LFU Decision:**
+
+```
+Access Frequencies (after decay):
+- hotkey: ~900 (decayed from 1000)
+- burst1: ~100
+- burst2: ~100
+- newkey: ~1
+
+Evict: newkey (lowest frequency)
+```
+
+**When LFU Wins:**
+- Workloads with persistent hot keys
+- Burst access patterns
+- Long cache retention
+
+**When LRU Wins:**
+- Temporal locality (recent = future access)
+- Sequential scans
+- Changing access patterns
+
+---
+
+### Summary
+
+**Morris Counter:**
+- ✅ 8-bit counter represents ~1M accesses
+- ✅ Logarithmic storage: V ≈ log₂(N)
+- ✅ Probabilistic increment prevents saturation
+- ✅ Higher precision for small counts
+
+**Time Decay:**
+- ✅ 16-bit timestamp (45-day cycle)
+- ✅ Configurable decay rate
+- ✅ Prevents stale hot keys
+- ✅ On-demand decay (no background thread)
+
+**LFU Implementation:**
+- ✅ Same 24-bit overhead as LRU
+- ✅ Combines frequency + time
+- ✅ Handles wrap-around
+- ✅ Production-grade approximate algorithm
+
+**Design Brilliance:**
+- **3 bytes** store both frequency (~1M range) and time (45 days)
+- **No background threads** (decay on access)
+- **Probabilistic** to avoid precision waste
+- **Beautiful engineering** for constrained resources
+
+---
+
+**END OF COMPREHENSIVE REDIS INTERNALS GUIDE**
+
+---
