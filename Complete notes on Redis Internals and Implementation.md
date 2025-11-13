@@ -1204,3 +1204,775 @@ In the next chapter, we'll implement the **asynchronous event loop** using `epol
 
 ---
 
+## Chapter 4: Speaking Redis's Language - The RESP Protocol
+
+### What is RESP?
+
+**RESP** (REdis Serialization Protocol) is a simple, efficient protocol for client-server communication in Redis.
+
+**Key Characteristics:**
+- **Request-Response Protocol**: Both requests and responses use RESP encoding
+- **Binary-Safe**: Can transmit any sequence of bytes
+- **Human-Readable**: Easy to read and debug
+- **Simple to Parse**: Minimal overhead, fast processing
+- **Performant**: Compact representation with prefixed lengths
+
+---
+
+### RESP Design Principles
+
+**1. Type Prefix**: Every data type starts with a special character
+**2. CRLF Termination**: Data ends with `\r\n` (Carriage Return Line Feed)
+**3. Prefixed Length**: Bulk strings and arrays specify length upfront
+**4. Low Overhead**: Minimal extra bytes
+
+**General Format:**
+```
+<type_indicator><data><CRLF>
+```
+
+---
+
+### RESP Data Types
+
+#### 1. Simple Strings
+
+**Format:** `+<string>\r\n`
+
+**Use Case:** Simple responses with low overhead
+
+**Examples:**
+```
++OK\r\n
++PONG\r\n
++QUEUED\r\n
+```
+
+**Overhead:** 1 byte (`+`) + 2 bytes (`\r\n`) = 3 bytes
+
+**Characteristics:**
+- Cannot contain `\r` or `\n` characters
+- Used for short, simple responses
+- Fast to parse (no length calculation needed)
+
+---
+
+#### 2. Errors
+
+**Format:** `-<error_message>\r\n`
+
+**Use Case:** Error responses
+
+**Examples:**
+```
+-ERR unknown command 'FOOBAR'\r\n
+-WRONGTYPE Operation against a key holding the wrong kind of value\r\n
+-KEY NOT FOUND\r\n
+```
+
+**Structure:**
+```
+-          # Error indicator
+<message>  # Error description
+\r\n       # Terminator
+```
+
+---
+
+#### 3. Integers
+
+**Format:** `:<integer>\r\n`
+
+**Use Case:** Numeric responses (counts, boolean values, timestamps)
+
+**Examples:**
+```
+:0\r\n          # Zero/false
+:1\r\n          # One/true
+:1729\r\n       # Any 64-bit integer
+:-1\r\n         # Negative integer
+:1000000\r\n    # Large integer
+```
+
+**Range:** 64-bit signed integers (-2^63 to 2^63-1)
+
+**Use Cases:**
+- INCR/DECR return values
+- List/Set cardinality
+- Boolean results (0 = false, 1 = true)
+- TTL values
+
+---
+
+#### 4. Bulk Strings
+
+**Format:** `$<length>\r\n<data>\r\n`
+
+**Use Case:** Binary-safe strings (can contain any bytes, including `\0`, `\r\n`)
+
+**Examples:**
+
+**String "PONG":**
+```
+$4\r\n
+PONG\r\n
+```
+
+**Breakdown:**
+```
+$           # Bulk string indicator
+4           # Length in bytes
+\r\n        # CRLF
+PONG        # Actual data (4 bytes)
+\r\n        # Terminating CRLF
+```
+
+**String "hello world":**
+```
+$11\r\n
+hello world\r\n
+```
+
+**Empty string:**
+```
+$0\r\n
+\r\n
+```
+- Length is 0
+- Still has data section (empty)
+- Followed by CRLF
+
+**Null value:**
+```
+$-1\r\n
+```
+- Length of -1 indicates NULL
+- No data section
+- Represents absence of value
+
+---
+
+#### Why Prefixed Length Matters
+
+**Problem with null-terminated strings (C strings):**
+```c
+char* str = "hello\0world";  // Only "hello" visible
+```
+
+**Bulk strings are binary-safe:**
+```
+$11\r\n
+hello\0world\r\n
+```
+- Parser reads exactly 11 bytes after length
+- `\0` is just another byte
+- Can transmit images, binary data, etc.
+
+**Performance benefit:**
+- Know exactly how many bytes to read
+- Allocate buffer of exact size
+- Single read operation (no scanning for terminator)
+
+---
+
+#### 5. Arrays
+
+**Format:** `*<count>\r\n<element1><element2>...<elementN>`
+
+**Use Case:** Commands, multiple responses, nested structures
+
+**Examples:**
+
+**Array with 3 elements (all bulk strings):**
+```
+*3\r\n
+$3\r\nSET\r\n
+$1\r\nk\r\n
+$1\r\nv\r\n
+```
+
+**Breakdown:**
+```
+*3          # Array with 3 elements
+\r\n
+$3\r\nSET\r\n   # Element 1: Bulk string "SET"
+$1\r\nk\r\n     # Element 2: Bulk string "k"
+$1\r\nv\r\n     # Element 3: Bulk string "v"
+```
+
+**Mixed-type array (string, integer, string):**
+```
+*3\r\n
+$1\r\nA\r\n      # Bulk string "A"
+:200\r\n         # Integer 200
+$3\r\ncat\r\n    # Bulk string "cat"
+```
+
+**Nested arrays:**
+```
+*2\r\n
+*3\r\n
+:1\r\n:2\r\n:3\r\n    # Inner array [1, 2, 3]
+*2\r\n
+$5\r\nHello\r\n
+$5\r\nWorld\r\n       # Inner array ["Hello", "World"]
+```
+
+**Empty array:**
+```
+*0\r\n
+```
+
+**Null array:**
+```
+*-1\r\n
+```
+
+---
+
+### RESP in Action: Redis Commands
+
+#### PING Command
+
+**Client sends:**
+```
+*1\r\n
+$4\r\n
+PING\r\n
+```
+
+**Server responds:**
+```
++PONG\r\n
+```
+
+---
+
+#### SET Command
+
+**Client sends: `SET key value`**
+```
+*3\r\n
+$3\r\nSET\r\n
+$3\r\nkey\r\n
+$5\r\nvalue\r\n
+```
+
+**Server responds:**
+```
++OK\r\n
+```
+
+---
+
+#### GET Command
+
+**Client sends: `GET key`**
+```
+*2\r\n
+$3\r\nGET\r\n
+$3\r\nkey\r\n
+```
+
+**Server responds (key exists):**
+```
+$5\r\n
+value\r\n
+```
+
+**Server responds (key doesn't exist):**
+```
+$-1\r\n
+```
+
+---
+
+#### INCR Command
+
+**Client sends: `INCR counter`**
+```
+*2\r\n
+$4\r\nINCR\r\n
+$7\r\ncounter\r\n
+```
+
+**Server responds:**
+```
+:42\r\n
+```
+
+---
+
+### Why RESP is Efficient
+
+**1. Compact Representation**
+- Minimal overhead (1-3 bytes per data type)
+- No verbose XML/JSON wrapping
+- Binary-safe without base64 encoding
+
+**2. Fast Parsing**
+- Type identified by first byte
+- Prefixed lengths enable single-pass parsing
+- No backtracking or lookahead needed
+
+**3. Buffer Optimization**
+- Know exact buffer size upfront
+- Avoid repeated allocations
+- Single read from network
+
+**4. Human-Readable**
+- Easy to debug with `nc` or `telnet`
+- Clear structure for learning
+- Simple to implement
+
+**Example: Reading bulk string**
+```go
+// Read "$4\r\n"
+length := parseLength()  // Get 4
+
+// Allocate buffer of exact size
+buffer := make([]byte, length)
+
+// Read exactly 4 bytes
+read(buffer)  // "PONG"
+
+// Read trailing "\r\n"
+read(2)
+```
+
+**Single network read, optimal buffer allocation!**
+
+---
+
+## Chapter 5: Implementing RESP Decoder in Go
+
+### Decoder Architecture
+
+**Goal:** Parse RESP-encoded byte stream into Go data structures
+
+**Main Function:**
+```go
+func Decode(data []byte) (interface{}, error)
+```
+
+**Input:** Raw bytes from network
+**Output:** Decoded Go value (string, int, array, etc.)
+
+---
+
+### Helper Function: `decode1`
+
+**Purpose:** Decode the *first* RESP value from byte slice
+
+**Signature:**
+```go
+func decode1(data []byte) (value interface{}, delta int, error error)
+```
+
+**Returns:**
+- `value`: Decoded Go value
+- `delta`: Number of bytes consumed
+- `error`: Parsing error (if any)
+
+**Why return delta?**
+- Multiple RESP values may be concatenated
+- Need to know where next value starts
+- Enables parsing pipelined commands
+
+---
+
+### Type Detection
+
+**First byte determines type:**
+
+```go
+func decode1(data []byte) (interface{}, int, error) {
+    if len(data) == 0 {
+        return nil, 0, errors.New("empty data")
+    }
+
+    switch data[0] {
+    case '+':
+        return decodeSimpleString(data)
+    case '-':
+        return decodeError(data)
+    case ':':
+        return decodeInteger(data)
+    case '$':
+        return decodeBulkString(data)
+    case '*':
+        return decodeArray(data)
+    default:
+        return nil, 0, fmt.Errorf("unknown RESP type: %c", data[0])
+    }
+}
+```
+
+---
+
+### Decoding Simple Strings
+
+**Format:** `+<string>\r\n`
+
+**Implementation:**
+```go
+func decodeSimpleString(data []byte) (string, int, error) {
+    // Start from position 1 (skip '+')
+    pos := 1
+
+    // Find '\r\n'
+    for pos < len(data) {
+        if data[pos] == '\r' && pos+1 < len(data) && data[pos+1] == '\n' {
+            // Extract string between '+' and '\r\n'
+            str := string(data[1:pos])
+            return str, pos + 2, nil  // +2 for \r\n
+        }
+        pos++
+    }
+
+    return "", 0, errors.New("incomplete simple string")
+}
+```
+
+**Example:**
+```
+Input:  []byte("+PONG\r\n")
+Output: "PONG", 7, nil
+```
+
+---
+
+### Decoding Errors
+
+**Format:** `-<error_message>\r\n`
+
+**Implementation:**
+```go
+func decodeError(data []byte) (string, int, error) {
+    // Reuse simple string logic (structure is identical)
+    str, delta, err := decodeSimpleString(data)
+    if err != nil {
+        return "", 0, err
+    }
+
+    return str, delta, nil
+}
+```
+
+**Example:**
+```
+Input:  []byte("-ERR unknown command\r\n")
+Output: "ERR unknown command", 22, nil
+```
+
+---
+
+### Decoding Integers
+
+**Format:** `:<integer>\r\n`
+
+**Implementation:**
+```go
+func decodeInteger(data []byte) (int64, int, error) {
+    pos := 1  // Skip ':'
+    var value int64 = 0
+    negative := false
+
+    // Handle negative sign
+    if data[pos] == '-' {
+        negative = true
+        pos++
+    }
+
+    // Parse digits
+    for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+        digit := int64(data[pos] - '0')
+        value = value*10 + digit
+        pos++
+    }
+
+    // Apply sign
+    if negative {
+        value = -value
+    }
+
+    // Verify '\r\n'
+    if pos+1 >= len(data) || data[pos] != '\r' || data[pos+1] != '\n' {
+        return 0, 0, errors.New("invalid integer format")
+    }
+
+    return value, pos + 2, nil
+}
+```
+
+**Example:**
+```
+Input:  []byte(":1729\r\n")
+Output: 1729, 7, nil
+
+Input:  []byte(":-42\r\n")
+Output: -42, 6, nil
+```
+
+---
+
+### Helper: Reading Length
+
+**Used by bulk strings and arrays:**
+
+```go
+func readLength(data []byte, pos int) (int, int, error) {
+    start := pos
+    length := 0
+
+    // Parse digits
+    for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+        digit := int(data[pos] - '0')
+        length = length*10 + digit
+        pos++
+    }
+
+    // Verify '\r\n'
+    if pos+1 >= len(data) || data[pos] != '\r' || data[pos+1] != '\n' {
+        return 0, 0, errors.New("invalid length format")
+    }
+
+    delta := pos - start + 2  // +2 for \r\n
+    return length, delta, nil
+}
+```
+
+---
+
+### Decoding Bulk Strings
+
+**Format:** `$<length>\r\n<data>\r\n`
+
+**Implementation:**
+```go
+func decodeBulkString(data []byte) (string, int, error) {
+    // Read length
+    length, delta, err := readLength(data, 1)  // Start at position 1 (skip '$')
+    if err != nil {
+        return "", 0, err
+    }
+
+    pos := 1 + delta
+
+    // Handle NULL bulk string
+    if length == -1 {
+        return "", pos, nil  // Return empty string for NULL
+    }
+
+    // Extract data
+    if pos+length+2 > len(data) {
+        return "", 0, errors.New("incomplete bulk string")
+    }
+
+    str := string(data[pos : pos+length])
+    pos += length
+
+    // Verify trailing '\r\n'
+    if data[pos] != '\r' || data[pos+1] != '\n' {
+        return "", 0, errors.New("bulk string missing trailing CRLF")
+    }
+
+    return str, pos + 2, nil
+}
+```
+
+**Example:**
+```
+Input:  []byte("$4\r\nPONG\r\n")
+Output: "PONG", 10, nil
+
+Input:  []byte("$-1\r\n")
+Output: "", 5, nil  // NULL value
+```
+
+---
+
+### Decoding Arrays
+
+**Format:** `*<count>\r\n<element1><element2>...`
+
+**Implementation:**
+```go
+func decodeArray(data []byte) ([]interface{}, int, error) {
+    // Read element count
+    count, delta, err := readLength(data, 1)  // Skip '*'
+    if err != nil {
+        return nil, 0, err
+    }
+
+    pos := 1 + delta
+
+    // Handle NULL array
+    if count == -1 {
+        return nil, pos, nil
+    }
+
+    // Allocate result array
+    result := make([]interface{}, count)
+
+    // Decode each element recursively
+    for i := 0; i < count; i++ {
+        value, elementDelta, err := decode1(data[pos:])
+        if err != nil {
+            return nil, 0, fmt.Errorf("error decoding array element %d: %v", i, err)
+        }
+
+        result[i] = value
+        pos += elementDelta
+    }
+
+    return result, pos, nil
+}
+```
+
+**Example:**
+```
+Input:  []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+Output: []interface{}{"SET", "k", "v"}, 26, nil
+```
+
+---
+
+### Complete Decoder
+
+```go
+package resp
+
+import (
+    "errors"
+    "fmt"
+)
+
+// Decode parses RESP data and returns first value
+func Decode(data []byte) (interface{}, error) {
+    value, _, err := decode1(data)
+    return value, err
+}
+
+// decode1 decodes first RESP value, returns value, bytes consumed, error
+func decode1(data []byte) (interface{}, int, error) {
+    if len(data) == 0 {
+        return nil, 0, errors.New("empty data")
+    }
+
+    switch data[0] {
+    case '+':
+        return decodeSimpleString(data)
+    case '-':
+        return decodeError(data)
+    case ':':
+        return decodeInteger(data)
+    case '$':
+        return decodeBulkString(data)
+    case '*':
+        return decodeArray(data)
+    default:
+        return nil, 0, fmt.Errorf("unknown RESP type: %c", data[0])
+    }
+}
+
+// ... (decoding functions as shown above)
+```
+
+---
+
+### Handling Nested Structures
+
+**Recursive array decoding automatically handles nesting:**
+
+```
+*2\r\n           # Array with 2 elements
+*3\r\n:1\r\n:2\r\n:3\r\n    # Element 1: Array [1, 2, 3]
+$5\r\nHello\r\n             # Element 2: Bulk string "Hello"
+```
+
+**Parsing flow:**
+1. `decodeArray` sees `*2` → allocate array of size 2
+2. Recursively call `decode1` for element 1:
+   - Sees `*3` → allocate nested array
+   - Recursively decodes integers 1, 2, 3
+3. Recursively call `decode1` for element 2:
+   - Sees `$5` → decode bulk string "Hello"
+4. Return: `[]interface{}{[]interface{}{1, 2, 3}, "Hello"}`
+
+---
+
+### Key Design Patterns
+
+**1. Delta Return Pattern**
+- Every decoding function returns bytes consumed
+- Enables sequential parsing: `pos += delta`
+- Clean handling of concatenated values
+
+**2. Recursive Descent**
+- Arrays recursively call `decode1`
+- Naturally handles any nesting depth
+- Simple, elegant code
+
+**3. Type Switching**
+- First byte determines parser
+- O(1) type detection
+- Extensible for new types
+
+**4. Error Propagation**
+- Errors bubble up from inner decoders
+- Provides context (which element failed)
+- Early return on error
+
+---
+
+### Testing the Decoder
+
+```go
+func main() {
+    // Test simple string
+    data1 := []byte("+PONG\r\n")
+    result1, _ := Decode(data1)
+    fmt.Println(result1)  // Output: PONG
+
+    // Test integer
+    data2 := []byte(":42\r\n")
+    result2, _ := Decode(data2)
+    fmt.Println(result2)  // Output: 42
+
+    // Test bulk string
+    data3 := []byte("$5\r\nHello\r\n")
+    result3, _ := Decode(data3)
+    fmt.Println(result3)  // Output: Hello
+
+    // Test array
+    data4 := []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    result4, _ := Decode(data4)
+    fmt.Println(result4)  // Output: [SET k v]
+}
+```
+
+---
+
+### Summary
+
+**What We Built:**
+- Complete RESP decoder in Go
+- Handles all 5 RESP data types
+- Supports nested structures
+- Binary-safe parsing
+
+**Key Concepts:**
+1. **Type Prefix Detection**: First byte determines type
+2. **Prefixed Length**: Enables optimal buffer allocation
+3. **Delta Pattern**: Track bytes consumed for sequential parsing
+4. **Recursive Descent**: Natural handling of nested arrays
+5. **Binary Safety**: Bulk strings can contain any bytes
+
+**Next Steps:**
+- Implement RESP encoder
+- Integrate with TCP server
+- Build command parser on top of RESP decoder
+
+---
+
