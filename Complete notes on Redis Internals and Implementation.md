@@ -5359,3 +5359,1115 @@ func evalBFADD(args []string) []byte {
 
 ---
 
+## Chapter 15: INFO Command and Monitoring
+
+### What is the INFO Command?
+
+The **INFO command** is Redis's built-in monitoring and observability tool that returns real-time statistics about the server's state, memory usage, connected clients, and more.
+
+**Purpose:**
+- Monitor database health
+- Set up alerts and dashboards
+- Debug performance issues
+- Track key metrics over time
+
+**Basic usage:**
+```bash
+redis-cli INFO
+```
+
+---
+
+### INFO Command Format
+
+**Response Structure:**
+
+```
+# Keyspace
+db0:keys=1000,expires=50,avg_ttl=3600000
+db1:keys=0,expires=0,avg_ttl=0
+
+# Server
+redis_version:7.0.0
+redis_mode:standalone
+os:Linux 5.10.0-x86_64
+uptime_in_seconds:86400
+
+# Memory
+used_memory:1048576
+used_memory_human:1.00M
+maxmemory:2097152
+maxmemory_human:2.00M
+```
+
+**Format Specification:**
+- Each section starts with `# Section_Name`
+- Followed by `key:value` pairs
+- Each line terminated with `\r\n`
+- Values can be comma-separated (e.g., `keys=1000,expires=50`)
+
+---
+
+### Key Sections and Metrics
+
+#### 1. Keyspace Section
+
+**Most Important Metrics:**
+
+| Metric | Description | Example |
+|--------|-------------|---------|
+| `keys` | Total number of keys in database | `keys=10000` |
+| `expires` | Number of keys with expiration set | `expires=250` |
+| `avg_ttl` | Average time-to-live in milliseconds | `avg_ttl=3600000` |
+
+**Example:**
+```bash
+127.0.0.1:6379> INFO keyspace
+# Keyspace
+db0:keys=15,expires=3,avg_ttl=120000
+```
+
+#### 2. Memory Section
+
+```bash
+used_memory:5242880          # 5 MB in bytes
+used_memory_human:5.00M      # Human-readable format
+used_memory_rss:6291456      # Resident set size (OS perspective)
+maxmemory:10485760           # Memory limit (10 MB)
+maxmemory_policy:allkeys-lru # Eviction policy
+mem_fragmentation_ratio:1.20 # Memory fragmentation
+```
+
+#### 3. Stats Section
+
+```bash
+total_connections_received:1000
+total_commands_processed:50000
+instantaneous_ops_per_sec:100
+keyspace_hits:8000
+keyspace_misses:2000
+evicted_keys:150
+```
+
+**Key Derived Metrics:**
+```
+Hit Rate = keyspace_hits / (keyspace_hits + keyspace_misses)
+        = 8000 / (8000 + 2000)
+        = 80%
+```
+
+---
+
+### Implementation
+
+#### Go Implementation
+
+```go
+// Global stats tracker
+var keyspaceStats = make(map[int]map[string]int64)
+
+func init() {
+    // Initialize stats for db0-db3
+    for i := 0; i < 4; i++ {
+        keyspaceStats[i] = map[string]int64{
+            "keys":    0,
+            "expires": 0,
+            "avg_ttl": 0,
+        }
+    }
+}
+
+// evalINFO handles the INFO command
+func evalINFO(args []string) []byte {
+    var buf bytes.Buffer
+
+    // Keyspace section
+    buf.WriteString("# Keyspace\r\n")
+
+    for dbID := 0; dbID < 4; dbID++ {
+        stats := keyspaceStats[dbID]
+        buf.WriteString(fmt.Sprintf(
+            "db%d:keys=%d,expires=%d,avg_ttl=%d\r\n",
+            dbID,
+            stats["keys"],
+            stats["expires"],
+            stats["avg_ttl"],
+        ))
+    }
+
+    // Return as bulk string
+    return resp.EncodeBulkString(buf.String())
+}
+
+// Update stats on key operations
+func updateKeyspaceStats(dbID int, metric string, delta int64) {
+    keyspaceStats[dbID][metric] += delta
+}
+```
+
+#### Tracking Key Count
+
+**On Key Insert (PUT):**
+```go
+func Put(key string, obj *Object) {
+    store[key] = obj
+
+    // Increment key count
+    updateKeyspaceStats(0, "keys", 1)
+
+    // Track expiration
+    if obj.ExpiresAt > 0 {
+        updateKeyspaceStats(0, "expires", 1)
+    }
+}
+```
+
+**On Key Delete:**
+```go
+func Delete(key string) bool {
+    obj, exists := store[key]
+    if !exists {
+        return false
+    }
+
+    // Decrement key count
+    updateKeyspaceStats(0, "keys", -1)
+
+    // Track expiration removal
+    if obj.ExpiresAt > 0 {
+        updateKeyspaceStats(0, "expires", -1)
+    }
+
+    delete(store, key)
+    return true
+}
+```
+
+---
+
+### Monitoring Stack Integration
+
+#### Architecture
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│    Redis     │────>│   Exporter   │────>│  Prometheus  │
+│   (DiceDB)   │     │              │     │  (TSDB)      │
+└──────────────┘     └──────────────┘     └──────────────┘
+   INFO command      Scrapes metrics      Stores time-series
+                     every 15s                    │
+                                                  │
+                                                  ↓
+                                          ┌──────────────┐
+                                          │   Grafana    │
+                                          │  (Visualize) │
+                                          └──────────────┘
+```
+
+**Components:**
+
+1. **Redis Exporter**: Prometheus exporter that periodically executes `INFO` and exposes metrics
+2. **Prometheus**: Time-series database that scrapes and stores metrics
+3. **Grafana**: Visualization platform for creating dashboards
+
+---
+
+### Observing Eviction Patterns
+
+#### The Sawtooth Pattern
+
+When running a continuous write workload against a memory-limited Redis instance with eviction enabled, you'll observe a **sawtooth pattern** in the key count graph:
+
+```
+Keys
+ │
+100├───╱╲───╱╲───╱╲───╱╲
+ 80│  ╱  ╲ ╱  ╲ ╱  ╲ ╱  ╲
+ 60│ ╱    ╳    ╳    ╳    ╲
+ 40│╱    ╱ ╲  ╱ ╲  ╱ ╲
+   └────────────────────────> Time
+```
+
+**Why Sawtooth?**
+
+1. **Fill Phase**: Keys inserted until limit (e.g., 100 keys)
+2. **Eviction Trigger**: Memory/key limit exceeded
+3. **Eviction Phase**: 40% of keys evicted (40 keys removed)
+4. **Repeat**: Back to 60 keys, fill again
+
+---
+
+### Summary
+
+**What INFO Provides:**
+1. ✅ Real-time database statistics
+2. ✅ Key count, memory usage, hit rates
+3. ✅ Server metadata (version, uptime)
+4. ✅ Foundation for monitoring stack
+
+**Implementation Details:**
+1. ✅ Global stats tracker (`keyspaceStats`)
+2. ✅ Update on PUT/DELETE operations
+3. ✅ Format as `# Section\r\nkey:value\r\n`
+4. ✅ Return as RESP bulk string
+
+**Monitoring Stack:**
+1. ✅ Redis Exporter → scrapes INFO every 15s
+2. ✅ Prometheus → stores time-series data
+3. ✅ Grafana → visualizes metrics
+
+**Next:** Approximated LRU algorithm theory
+
+---
+## Chapter 16: The Approximated LRU Algorithm
+
+### What is LRU?
+
+**Least Recently Used (LRU)** is a cache eviction algorithm that removes the least recently accessed items first, based on the principle of **temporal locality**: recently accessed data is more likely to be accessed again soon.
+
+**Ideal LRU Behavior:**
+
+```
+Time    Access    Cache State
+----    ------    -----------
+t=0     SET A     [A]
+t=1     SET B     [A, B]
+t=2     SET C     [A, B, C]
+t=3     GET A     [B, C, A]    ← A moved to front
+t=4     SET D     [C, A, D]    ← B evicted (least recent)
+```
+
+---
+
+### Why Not Exact LRU?
+
+#### Naive Exact LRU Implementation
+
+**Approach 1: Timestamp + Sorting**
+
+```go
+type Object struct {
+    Value         interface{}
+    LastAccessedAt time.Time
+}
+
+func evictLRU() {
+    // Sort all keys by LastAccessedAt
+    keys := getAllKeys()
+    sort.Slice(keys, func(i, j int) bool {
+        return keys[i].LastAccessedAt.Before(keys[j].LastAccessedAt)
+    })
+
+    // Evict oldest
+    delete(store, keys[0].Key)
+}
+```
+
+**Problems:**
+- ❌ **O(N log N) sorting** on every eviction (catastrophic at scale)
+- ❌ **32-bit timestamp** per object (4 bytes × 1M keys = 4MB overhead)
+- ❌ **No real-time ordering**
+
+---
+
+**Approach 2: Doubly Linked List**
+
+```go
+type LRUCache struct {
+    capacity int
+    cache    map[string]*Node
+    head     *Node
+    tail     *Node
+}
+
+type Node struct {
+    Key   string
+    Value interface{}
+    Prev  *Node
+    Next  *Node
+}
+
+func (c *LRUCache) Get(key string) interface{} {
+    if node, exists := c.cache[key]; exists {
+        c.moveToHead(node)  // Move to front
+        return node.Value
+    }
+    return nil
+}
+
+func (c *LRUCache) Put(key string, value interface{}) {
+    if len(c.cache) >= c.capacity {
+        c.removeTail()  // Evict LRU
+    }
+    // Insert at head
+}
+```
+
+**Exact LRU Guarantees:**
+- ✅ O(1) access and eviction
+- ✅ Perfect recency ordering
+
+**Problems for Redis:**
+- ❌ **Memory overhead**: 16 bytes per object (2 pointers × 8 bytes)
+  - 1M keys → 16MB wasted on pointers alone
+- ❌ **CPU overhead**: Constant pointer manipulation on every access
+- ❌ **Cache unfriendly**: Random memory access for linked nodes
+- ❌ **Fragmentation**: Nodes scattered across memory
+
+**For 1 million keys:**
+```
+Exact LRU overhead:
+  - Timestamp: 4 bytes × 1M = 4MB
+  - Pointers: 16 bytes × 1M = 16MB
+  - Total: 20MB of metadata (just for LRU!)
+```
+
+---
+
+### Redis's Solution: Approximated LRU
+
+#### Core Innovations
+
+1. **24-bit Clock**: Store only 24 bits of timestamp (not 32 or 64)
+2. **Sampling**: Don't scan all keys, sample N random keys (typically 5)
+3. **Eviction Pool**: Maintain small pool (16 items) of candidates
+4. **Simple Array**: Use array instead of doubly linked list
+
+**Benefits:**
+- ✅ **3 bytes per object** (not 20 bytes)
+- ✅ **No pointer overhead**
+- ✅ **No sorting overhead**
+- ✅ **Cache-friendly** (array access, not pointer chasing)
+
+---
+
+### The 24-bit LRU Clock
+
+#### Why 24 Bits?
+
+**Memory Layout in `redisObject`:**
+
+```c
+struct redisObject {
+    unsigned type:4;       // 4 bits
+    unsigned encoding:4;   // 4 bits
+    unsigned lru:24;       // 24 bits ← LRU clock stored here
+    int refcount;          // 32 bits
+    void *ptr;             // 64 bits (on 64-bit systems)
+};
+```
+
+**Total first 32 bits:**
+- type (4) + encoding (4) + lru (24) = 32 bits (fits in 1 CPU word)
+
+**If we used 32 bits for LRU:**
+- Would need extra 8 bits → breaks alignment
+- Wastes 1 byte per object
+- 1M objects → 1MB wasted
+
+---
+
+#### Computing the 24-bit Clock
+
+```go
+const LRU_CLOCK_MAX = (1 << 24) - 1  // 0xFFFFFF = 16,777,215
+
+func GetLRUClock() uint32 {
+    nowSeconds := uint32(time.Now().Unix())
+    return nowSeconds & LRU_CLOCK_MAX  // Mask to 24 bits
+}
+```
+
+**Behavior:**
+
+```
+Unix Time (seconds)     24-bit Clock
+--------------------    ------------
+1,700,000,000          →  11,046,144  (0xA8A900)
+1,700,000,001          →  11,046,145  (0xA8A901)
+...
+1,716,777,215          →  16,777,215  (0xFFFFFF) ← MAX
+1,716,777,216          →  0           (0x000000) ← WRAP!
+1,716,777,217          →  1           (0x000001)
+```
+
+**Clock Wraparound:**
+- 24 bits → max value: 16,777,215 seconds
+- **= 194 days**
+- After 194 days, clock wraps back to 0
+
+---
+
+### Calculating Idle Time with Wraparound
+
+**Challenge:** How to compute idle time when clock wraps around?
+
+**Solution:**
+
+```go
+func EstimateObjectIdleTime(obj *Object) uint32 {
+    currentClock := GetLRUClock()
+    lastAccessed := obj.LRU
+
+    var idleTime uint32
+
+    if currentClock >= lastAccessed {
+        // Normal case
+        idleTime = currentClock - lastAccessed
+    } else {
+        // Wraparound case
+        idleTime = (LRU_CLOCK_MAX - lastAccessed) + currentClock
+    }
+
+    return idleTime
+}
+```
+
+**Example (Wraparound):**
+
+```
+Scenario:
+- Key inserted at: LRU = 16,777,200 (near max)
+- Current time:    Clock = 100 (wrapped around)
+
+Calculation:
+idleTime = (LRU_CLOCK_MAX - lastAccessed) + currentClock
+         = (16,777,215 - 16,777,200) + 100
+         = 15 + 100
+         = 115 seconds
+```
+
+**Visual:**
+
+```
+Clock Timeline:
+  ...16,777,200 ──────> 16,777,215 (MAX) ──> 0 ──> 100
+      ▲                                          ▲
+    Inserted                                  Now
+      └──────────────────────────────────────┘
+                    115 seconds
+```
+
+---
+
+#### Edge Case: 194-Day Unaccessed Key
+
+**Problem:**
+
+If a key remains unaccessed for 194+ days:
+- Clock completes full cycle
+- Idle time calculation becomes ambiguous
+
+**Example:**
+
+```
+Key inserted:  Clock = 100
+194 days later: Clock = 100 (wrapped exactly once)
+
+Calculated idle time = 100 - 100 = 0 seconds ❌
+Actual idle time = 194 days ✓
+```
+
+**Redis's Stance:**
+
+> "If a key in a cache remains unaccessed for 194 days, it's effectively dead. This edge case is acceptable."
+
+**Practical Impact:**
+- ⚠️ Extremely rare in production caches
+- ✅ Trade-off for 8 bytes/object memory savings
+- ✅ 1M keys → 8MB saved
+
+---
+
+### Sampling-Based Eviction
+
+Instead of scanning **all keys** to find the true LRU, Redis:
+
+1. **Samples** N random keys (default: 5)
+2. Computes idle time for each
+3. Adds worst candidates to **eviction pool**
+4. Evicts from pool
+
+**Algorithm:**
+
+```go
+const SAMPLE_SIZE = 5
+const POOL_SIZE = 16
+
+func SampleAndEvict() {
+    pool := NewEvictionPool(POOL_SIZE)
+
+    // Sample random keys
+    samples := sampleRandomKeys(SAMPLE_SIZE)
+
+    for _, key := range samples {
+        obj := store[key]
+        idleTime := EstimateObjectIdleTime(obj)
+
+        // Add to pool if worse than current pool members
+        pool.Push(key, idleTime)
+    }
+
+    // Evict worst candidate (highest idle time)
+    victimKey := pool.PopWorst()
+    delete(store, victimKey)
+}
+```
+
+---
+
+### The Eviction Pool
+
+**Structure:**
+
+```go
+type EvictionPool struct {
+    Items  []PoolItem
+    KeySet map[string]struct{}  // Fast membership check
+}
+
+type PoolItem struct {
+    Key      string
+    IdleTime uint32
+}
+
+const POOL_SIZE = 16
+```
+
+**Why a Pool?**
+
+Instead of evicting immediately after sampling, Redis maintains a pool to:
+1. **Accumulate** best candidates across multiple sampling rounds
+2. **Always evict** the globally worst candidate seen so far
+3. **Avoid** premature eviction of recently sampled keys
+
+---
+
+### Why Array Over Doubly Linked List?
+
+**For small pool (16 elements):**
+
+| Operation | Array (unsorted) | Array (sorted) | Doubly Linked List |
+|-----------|-----------------|----------------|-------------------|
+| **Insert** | O(1) | O(N) for sort | O(1) |
+| **Find Min** | O(N) | O(1) | O(N) without min pointer |
+| **Remove** | O(N) | O(N) with shift | O(1) |
+| **Memory** | 16 items | 16 items | 16 items + 32 pointers |
+
+**Reality Check:**
+
+For N=16:
+- Array operations: ~16 comparisons (cache-friendly, sequential)
+- List operations: ~16 pointer dereferences (cache-unfriendly, random access)
+
+**Winner: Array**
+- ✅ **Cache locality**: All items in contiguous memory
+- ✅ **Fewer allocations**: Single array allocation
+- ✅ **No pointer overhead**: 16 × 2 × 8 = 256 bytes saved
+
+---
+
+### Summary
+
+**Approximated LRU Design:**
+1. ✅ **24-bit clock**: 3 bytes per object (vs 20 bytes)
+2. ✅ **Clock wraparound**: 194-day cycle (acceptable edge case)
+3. ✅ **Sampling**: Check 5 random keys (not all keys)
+4. ✅ **Eviction pool**: Size 16 array (not doubly linked list)
+5. ✅ **Cache-friendly**: Sequential array access
+
+**Key Insights:**
+- **Memory efficiency** over theoretical perfection
+- **Approximation** is acceptable for cache workloads
+- **Simple data structures** (arrays) beat complex ones at small scale
+- **Trade-offs** are explicit and well-justified
+
+**Accuracy:**
+- 5 samples: ~95% match to exact LRU
+- 10 samples: ~98% match to exact LRU
+- Good enough for real-world caching
+
+**Next:** Implementing approximated LRU in practice
+
+---
+
+## Chapter 17: Implementing the Approximated LRU Algorithm
+
+### Redis Source Code Structure
+
+The LRU implementation in Redis is located in `evict.c`, containing:
+- Clock management functions
+- Idle time calculation
+- Eviction pool logic
+- Main eviction loop
+
+**Key Constants:**
+
+```c
+#define EVPOOL_SIZE 16
+#define EVPOOL_CACHED_SIZE 5  // Sample size
+#define LRU_CLOCK_MAX ((1<<24)-1)  // 0xFFFFFF
+#define LRU_CLOCK_RESOLUTION 1000   // 1 second
+```
+
+---
+
+### Core Functions
+
+#### 1. Getting the LRU Clock
+
+```c
+unsigned int getLRUClock(void) {
+    return (mstime() / LRU_CLOCK_RESOLUTION) & LRU_CLOCK_MAX;
+}
+```
+
+**Go Implementation:**
+
+```go
+const (
+    LRU_CLOCK_MAX        = (1 << 24) - 1  // 16,777,215
+    LRU_CLOCK_RESOLUTION = 1              // 1 second
+)
+
+func GetLRUClock() uint32 {
+    nowSeconds := uint32(time.Now().Unix())
+    return nowSeconds & LRU_CLOCK_MAX
+}
+```
+
+**Breakdown:**
+```
+time.Now().Unix()  → 1,700,000,000 (epoch seconds)
+& 0xFFFFFF         → 11,046,144    (last 24 bits)
+```
+
+---
+
+#### 2. Estimating Object Idle Time
+
+```c
+unsigned long estimateObjectIdleTime(robj *o) {
+    unsigned long long lruclock = LRUClock();
+    if (lruclock >= o->lru) {
+        return (lruclock - o->lru) * LRU_CLOCK_RESOLUTION;
+    } else {
+        return (LRU_CLOCK_MAX - o->lru + lruclock) * LRU_CLOCK_RESOLUTION;
+    }
+}
+```
+
+**Go Implementation:**
+
+```go
+func EstimateObjectIdleTime(obj *Object) uint32 {
+    currentClock := GetLRUClock()
+    lastAccessed := obj.LastAccessedAt
+
+    var idleTime uint32
+
+    if currentClock >= lastAccessed {
+        // Normal case: no wraparound
+        idleTime = currentClock - lastAccessed
+    } else {
+        // Wraparound case
+        idleTime = (LRU_CLOCK_MAX - lastAccessed) + currentClock
+    }
+
+    return idleTime * LRU_CLOCK_RESOLUTION
+}
+```
+
+---
+
+### Two Dictionary Architecture
+
+Redis uses **two hash tables** internally:
+
+#### 1. Main Store (All Keys)
+
+```go
+// stores all key-value pairs
+var store = make(map[string]*Object)
+```
+
+**Purpose:** Primary key-value storage
+
+---
+
+#### 2. Expires Index (Keys with TTL)
+
+```go
+// stores only keys with expiration
+var expires = make(map[*Object]int64)
+```
+
+**Purpose:**
+- Quick iteration over keys with expiration
+- Faster sampling for `volatile-*` eviction policies
+- Efficient expiry scanning
+
+---
+
+### Object Structure with LRU
+
+**Go Implementation:**
+
+```go
+type Object struct {
+    Value          interface{}
+    Type           ObjectType
+    Encoding       ObjectEncoding
+    LastAccessedAt uint32   // 24-bit LRU clock (stored as uint32)
+    ExpiresAt      int64    // Unix milliseconds
+}
+```
+
+**Note:** Go doesn't support bitfields, so we use `uint32` but only use lower 24 bits.
+
+---
+
+### Eviction Pool Implementation
+
+#### Pool Structure
+
+```go
+const POOL_SIZE = 16
+
+type EvictionPool struct {
+    Items  []PoolItem
+    KeySet map[string]struct{}
+}
+
+type PoolItem struct {
+    Key            string
+    LastAccessedAt uint32
+}
+```
+
+**Pool Invariants:**
+1. Max size = 16
+2. Sorted by idle time (ascending: best → worst)
+3. No duplicate keys
+
+---
+
+#### Push to Pool
+
+```go
+func (p *EvictionPool) Push(key string, lastAccessedAt uint32) {
+    // Skip duplicates
+    if _, exists := p.KeySet[key]; exists {
+        return
+    }
+
+    newItem := PoolItem{
+        Key:            key,
+        LastAccessedAt: lastAccessedAt,
+    }
+
+    if len(p.Items) < POOL_SIZE {
+        // Pool not full
+        p.Items = append(p.Items, newItem)
+        p.KeySet[key] = struct{}{}
+        p.sortByIdleTime()
+    } else {
+        // Pool full: only add if worse than best
+        bestIdleTime := GetIdleTime(p.Items[0].LastAccessedAt)
+        newIdleTime := GetIdleTime(lastAccessedAt)
+
+        if newIdleTime > bestIdleTime {
+            // Remove best (lowest idle time)
+            delete(p.KeySet, p.Items[0].Key)
+
+            // Replace with new item
+            p.Items[0] = newItem
+            p.KeySet[key] = struct{}{}
+            p.sortByIdleTime()
+        }
+    }
+}
+
+func (p *EvictionPool) sortByIdleTime() {
+    sort.Slice(p.Items, func(i, j int) bool {
+        idleI := GetIdleTime(p.Items[i].LastAccessedAt)
+        idleJ := GetIdleTime(p.Items[j].LastAccessedAt)
+        return idleI < idleJ  // Ascending order
+    })
+}
+
+func GetIdleTime(lastAccessedAt uint32) uint32 {
+    currentClock := GetLRUClock()
+    if currentClock >= lastAccessedAt {
+        return currentClock - lastAccessedAt
+    }
+    return (LRU_CLOCK_MAX - lastAccessedAt) + currentClock
+}
+```
+
+**Note:** Redis uses `memmove()` for efficient array shifting instead of re-sorting. Our Go implementation uses `sort.Slice()` for simplicity.
+
+---
+
+#### Pop from Pool
+
+```go
+func (p *EvictionPool) Pop() string {
+    if len(p.Items) == 0 {
+        return ""
+    }
+
+    // Remove worst item (highest idle time, at end)
+    worst := p.Items[len(p.Items)-1]
+    p.Items = p.Items[:len(p.Items)-1]
+    delete(p.KeySet, worst.Key)
+
+    return worst.Key
+}
+```
+
+---
+
+### Populating the Eviction Pool
+
+```go
+func PopulateEvictionPool() {
+    const SAMPLE_SIZE = 5
+
+    // Sample random keys
+    samples := sampleRandomKeys(SAMPLE_SIZE)
+
+    for _, key := range samples {
+        obj, exists := store[key]
+        if !exists {
+            continue
+        }
+
+        // Skip expired keys
+        if HasExpired(obj) {
+            continue
+        }
+
+        // Add to pool
+        evictionPool.Push(key, obj.LastAccessedAt)
+    }
+}
+
+func sampleRandomKeys(count int) []string {
+    keys := make([]string, 0, count)
+
+    for key := range store {
+        keys = append(keys, key)
+        if len(keys) >= count {
+            break
+        }
+    }
+
+    return keys
+}
+```
+
+---
+
+### Main Eviction Loop
+
+```go
+func EvictKeysLRU(numToEvict int) int {
+    evicted := 0
+
+    for evicted < numToEvict {
+        // Ensure pool has candidates
+        if len(evictionPool.Items) == 0 {
+            PopulateEvictionPool()
+        }
+
+        // No more keys to evict
+        if len(evictionPool.Items) == 0 {
+            break
+        }
+
+        // Pop worst candidate
+        victimKey := evictionPool.Pop()
+
+        // Delete from store
+        obj := store[victimKey]
+        delete(store, victimKey)
+
+        // Delete from expires index
+        delete(expires, obj)
+
+        evicted++
+
+        // Update stats
+        updateKeyspaceStats(0, "keys", -1)
+        if obj.ExpiresAt > 0 {
+            updateKeyspaceStats(0, "expires", -1)
+        }
+    }
+
+    return evicted
+}
+```
+
+---
+
+### Integration with Store Operations
+
+#### On Key Access (GET)
+
+```go
+func Get(key string) (*Object, bool) {
+    obj, exists := store[key]
+    if !exists {
+        return nil, false
+    }
+
+    // Check expiration
+    if HasExpired(obj) {
+        Delete(key)
+        return nil, false
+    }
+
+    // Update LRU clock
+    obj.LastAccessedAt = GetLRUClock()
+
+    return obj, true
+}
+```
+
+#### On Key Insert/Update (SET)
+
+```go
+func Put(key string, obj *Object) {
+    // Update LRU clock
+    obj.LastAccessedAt = GetLRUClock()
+
+    // Store object
+    store[key] = obj
+
+    // Add to expires index if TTL set
+    if obj.ExpiresAt > 0 {
+        expires[obj] = obj.ExpiresAt
+    }
+
+    // Update stats
+    updateKeyspaceStats(0, "keys", 1)
+    if obj.ExpiresAt > 0 {
+        updateKeyspaceStats(0, "expires", 1)
+    }
+
+    // Trigger eviction if needed
+    if len(store) > config.MaxKeys {
+        EvictKeysLRU(int(float64(len(store)) * 0.1))  // Evict 10%
+    }
+}
+```
+
+#### On Key Delete
+
+```go
+func Delete(key string) bool {
+    obj, exists := store[key]
+    if !exists {
+        return false
+    }
+
+    // Remove from both dictionaries
+    delete(store, key)
+    delete(expires, obj)
+
+    // Update stats
+    updateKeyspaceStats(0, "keys", -1)
+    if obj.ExpiresAt > 0 {
+        updateKeyspaceStats(0, "expires", -1)
+    }
+
+    return true
+}
+```
+
+---
+
+### Testing LRU Eviction
+
+**Test Scenario:**
+
+```go
+func TestLRU() {
+    config.MaxKeys = 100
+
+    // Insert 100 keys
+    for i := 0; i < 100; i++ {
+        key := fmt.Sprintf("key_%d", i)
+        Put(key, &Object{Value: fmt.Sprintf("value_%d", i)})
+        time.Sleep(1 * time.Millisecond)
+    }
+
+    fmt.Println("Keys:", len(store))  // 100
+
+    // Access first 50 keys (make them recently used)
+    for i := 0; i < 50; i++ {
+        key := fmt.Sprintf("key_%d", i)
+        Get(key)
+    }
+
+    // Insert 20 more keys (trigger eviction)
+    for i := 100; i < 120; i++ {
+        key := fmt.Sprintf("key_%d", i)
+        Put(key, &Object{Value: fmt.Sprintf("value_%d", i)})
+    }
+
+    fmt.Println("Keys after eviction:", len(store))  // ~100
+
+    // Expected: key_50 to key_99 evicted (least recently used)
+    // key_0 to key_49 retained (recently accessed)
+    // key_100 to key_119 retained (newly inserted)
+}
+```
+
+---
+
+### Performance Characteristics
+
+**Time Complexity:**
+
+| Operation | Complexity |
+|-----------|-----------|
+| Get/Set (LRU update) | O(1) |
+| Sample keys | O(SAMPLE_SIZE) = O(5) = O(1) |
+| Pool push | O(POOL_SIZE log POOL_SIZE) = O(16 log 16) ≈ O(1) |
+| Pool pop | O(1) |
+| Evict one key | O(SAMPLE_SIZE + POOL_SIZE) ≈ O(1) |
+
+**Space Complexity:**
+- Per object: 4 bytes (`LastAccessedAt` as uint32, using 24 bits)
+- Eviction pool: 16 × (8 bytes key pointer + 4 bytes LRU) ≈ 192 bytes
+- Expires map: 8 bytes per key with TTL
+
+---
+
+### Summary
+
+**Implementation Highlights:**
+1. ✅ **24-bit clock**: `GetLRUClock()` masks to 0xFFFFFF
+2. ✅ **Wraparound handling**: Check `current >= last` for idle time
+3. ✅ **Two dictionaries**: `store` (all keys) + `expires` (TTL keys)
+4. ✅ **Eviction pool**: Fixed array of 16 items
+5. ✅ **Sampling**: Check 5 random keys per round
+6. ✅ **LRU update**: Set `LastAccessedAt` on every access
+
+**Go vs Redis Differences:**
+- **Go**: No bitfields → use uint32 for 24-bit value
+- **Go**: `sort.Slice()` for pool → Redis uses `memmove()`
+- **Go**: Simple map iteration → Redis uses `dictGetSomeKeys()`
+- **Go**: Key count limit → Redis uses memory limit
+
+**Production Enhancements (Redis):**
+- Memory-based eviction (not key count)
+- ZMalloc wrapper for memory tracking
+- Async eviction in background
+- Multiple eviction policies (allkeys-lru, volatile-lru, etc.)
+
+**Next:** Custom memory allocators and persistence strategies
+
+---
