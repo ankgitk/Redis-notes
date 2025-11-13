@@ -2989,3 +2989,856 @@ PING_BULK: 44,500 requests per second
 
 ---
 
+# Part 3: Core Commands Implementation
+
+## Chapter 9: Implementing GET, SET, and TTL
+
+With our event loop and RESP protocol working, we can now implement Redis's core data storage commands.
+
+### In-Memory Data Store
+
+**Goal:** Implement a key-value store with expiration support
+
+**Data Structure:**
+
+```go
+// Global in-memory store
+var store = make(map[string]*Object)
+
+// Object represents a Redis value with metadata
+type Object struct {
+    Value      interface{}
+    Type       ObjectType
+    ExpiresAt  int64  // Unix milliseconds, 0 = no expiration
+}
+
+type ObjectType int
+
+const (
+    TypeString ObjectType = iota
+    TypeList
+    TypeSet
+    TypeHash
+    TypeZSet
+)
+```
+
+---
+
+### SET Command
+
+**Syntax:** `SET key value [EX seconds] [PX milliseconds] [NX|XX]`
+
+**Options:**
+- `EX seconds`: Set expiration in seconds
+- `PX milliseconds`: Set expiration in milliseconds
+- `NX`: Only set if key doesn't exist
+- `XX`: Only set if key already exists
+
+**Examples:**
+```bash
+SET name "Alice"           # Simple set
+SET counter 42 EX 60       # Expires in 60 seconds
+SET flag "value" NX        # Set only if doesn't exist
+```
+
+**Implementation:**
+
+```go
+func evalSET(args []string) []byte {
+    if len(args) < 2 {
+        return resp.EncodeError("ERR wrong number of arguments for 'set' command")
+    }
+
+    key := args[0]
+    value := args[1]
+
+    var expiryMs int64 = 0
+    var nx, xx bool = false, false
+
+    // Parse options
+    for i := 2; i < len(args); i++ {
+        option := strings.ToUpper(args[i])
+
+        switch option {
+        case "EX":
+            if i+1 >= len(args) {
+                return resp.EncodeError("ERR syntax error")
+            }
+            seconds, err := strconv.ParseInt(args[i+1], 10, 64)
+            if err != nil || seconds <= 0 {
+                return resp.EncodeError("ERR invalid expire time in set")
+            }
+            expiryMs = time.Now().UnixMilli() + (seconds * 1000)
+            i++ // Skip next arg
+
+        case "PX":
+            if i+1 >= len(args) {
+                return resp.EncodeError("ERR syntax error")
+            }
+            ms, err := strconv.ParseInt(args[i+1], 10, 64)
+            if err != nil || ms <= 0 {
+                return resp.EncodeError("ERR invalid expire time in set")
+            }
+            expiryMs = time.Now().UnixMilli() + ms
+            i++
+
+        case "NX":
+            nx = true
+
+        case "XX":
+            xx = true
+
+        default:
+            return resp.EncodeError("ERR syntax error")
+        }
+    }
+
+    // Check NX condition
+    if nx {
+        if _, exists := store[key]; exists {
+            return resp.EncodeBulkString("")  // nil reply
+        }
+    }
+
+    // Check XX condition
+    if xx {
+        if _, exists := store[key]; !exists {
+            return resp.EncodeBulkString("")  // nil reply
+        }
+    }
+
+    // Store the value
+    store[key] = &Object{
+        Value:     value,
+        Type:      TypeString,
+        ExpiresAt: expiryMs,
+    }
+
+    return resp.EncodeSimpleString("OK")
+}
+```
+
+---
+
+### GET Command
+
+**Syntax:** `GET key`
+
+**Returns:**
+- Bulk string: Value if key exists
+- Null: If key doesn't exist or expired
+
+**Implementation:**
+
+```go
+func evalGET(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'get' command")
+    }
+
+    key := args[0]
+
+    // Check if key exists
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeBulkString("")  // nil reply
+    }
+
+    // Check if expired
+    if obj.ExpiresAt > 0 && time.Now().UnixMilli() >= obj.ExpiresAt {
+        // Key expired, delete it
+        delete(store, key)
+        return resp.EncodeBulkString("")  // nil reply
+    }
+
+    // Return value
+    return resp.EncodeBulkString(obj.Value.(string))
+}
+```
+
+---
+
+### TTL Command
+
+**Syntax:** `TTL key`
+
+**Returns:**
+- `-2`: Key doesn't exist
+- `-1`: Key exists but has no expiration
+- `N`: Seconds until expiration
+
+**Implementation:**
+
+```go
+func evalTTL(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'ttl' command")
+    }
+
+    key := args[0]
+
+    // Check if key exists
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeInteger(-2)  // Key doesn't exist
+    }
+
+    // No expiration set
+    if obj.ExpiresAt == 0 {
+        return resp.EncodeInteger(-1)
+    }
+
+    // Calculate remaining time
+    now := time.Now().UnixMilli()
+    if now >= obj.ExpiresAt {
+        // Already expired
+        delete(store, key)
+        return resp.EncodeInteger(-2)
+    }
+
+    remainingMs := obj.ExpiresAt - now
+    remainingSeconds := remainingMs / 1000
+
+    return resp.EncodeInteger(remainingSeconds)
+}
+```
+
+---
+
+### PTTL Command
+
+**Syntax:** `PTTL key`
+
+**Returns milliseconds instead of seconds:**
+
+```go
+func evalPTTL(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'pttl' command")
+    }
+
+    key := args[0]
+
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeInteger(-2)
+    }
+
+    if obj.ExpiresAt == 0 {
+        return resp.EncodeInteger(-1)
+    }
+
+    now := time.Now().UnixMilli()
+    if now >= obj.ExpiresAt {
+        delete(store, key)
+        return resp.EncodeInteger(-2)
+    }
+
+    remainingMs := obj.ExpiresAt - now
+    return resp.EncodeInteger(remainingMs)
+}
+```
+
+---
+
+### Testing Storage Commands
+
+**Test 1: Basic SET/GET**
+```bash
+127.0.0.1:7379> SET name "Redis"
+OK
+127.0.0.1:7379> GET name
+"Redis"
+127.0.0.1:7379> GET nonexistent
+(nil)
+```
+
+**Test 2: Expiration**
+```bash
+127.0.0.1:7379> SET temp "value" EX 5
+OK
+127.0.0.1:7379> TTL temp
+(integer) 5
+127.0.0.1:7379> GET temp
+"value"
+# Wait 5 seconds
+127.0.0.1:7379> GET temp
+(nil)
+127.0.0.1:7379> TTL temp
+(integer) -2
+```
+
+**Test 3: NX/XX Options**
+```bash
+127.0.0.1:7379> SET key1 "value1" NX
+OK
+127.0.0.1:7379> SET key1 "value2" NX
+(nil)
+127.0.0.1:7379> SET key1 "value2" XX
+OK
+127.0.0.1:7379> GET key1
+"value2"
+```
+
+---
+
+## Chapter 10: Implementing DEL, EXPIRE, and Auto-Deletion
+
+### DEL Command
+
+**Syntax:** `DEL key [key ...]`
+
+**Returns:** Number of keys deleted
+
+**Implementation:**
+
+```go
+func evalDEL(args []string) []byte {
+    if len(args) < 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'del' command")
+    }
+
+    deletedCount := 0
+
+    for _, key := range args {
+        if _, exists := store[key]; exists {
+            delete(store, key)
+            deletedCount++
+        }
+    }
+
+    return resp.EncodeInteger(int64(deletedCount))
+}
+```
+
+**Examples:**
+```bash
+127.0.0.1:7379> SET k1 "v1"
+OK
+127.0.0.1:7379> SET k2 "v2"
+OK
+127.0.0.1:7379> DEL k1 k2 k3
+(integer) 2
+```
+
+---
+
+### EXPIRE Command
+
+**Syntax:** `EXPIRE key seconds`
+
+**Returns:**
+- `1`: Expiration was set
+- `0`: Key doesn't exist
+
+**Implementation:**
+
+```go
+func evalEXPIRE(args []string) []byte {
+    if len(args) != 2 {
+        return resp.EncodeError("ERR wrong number of arguments for 'expire' command")
+    }
+
+    key := args[0]
+    seconds, err := strconv.ParseInt(args[1], 10, 64)
+    if err != nil {
+        return resp.EncodeError("ERR value is not an integer or out of range")
+    }
+
+    // Check if key exists
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeInteger(0)
+    }
+
+    // Set expiration
+    obj.ExpiresAt = time.Now().UnixMilli() + (seconds * 1000)
+
+    return resp.EncodeInteger(1)
+}
+```
+
+---
+
+### PEXPIRE Command
+
+**Syntax:** `PEXPIRE key milliseconds`
+
+```go
+func evalPEXPIRE(args []string) []byte {
+    if len(args) != 2 {
+        return resp.EncodeError("ERR wrong number of arguments for 'pexpire' command")
+    }
+
+    key := args[0]
+    ms, err := strconv.ParseInt(args[1], 10, 64)
+    if err != nil {
+        return resp.EncodeError("ERR value is not an integer or out of range")
+    }
+
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeInteger(0)
+    }
+
+    obj.ExpiresAt = time.Now().UnixMilli() + ms
+    return resp.EncodeInteger(1)
+}
+```
+
+---
+
+### PERSIST Command
+
+**Syntax:** `PERSIST key`
+
+**Removes expiration from key**
+
+```go
+func evalPERSIST(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'persist' command")
+    }
+
+    key := args[0]
+
+    obj, exists := store[key]
+    if !exists {
+        return resp.EncodeInteger(0)
+    }
+
+    if obj.ExpiresAt == 0 {
+        return resp.EncodeInteger(0)  // Already persistent
+    }
+
+    obj.ExpiresAt = 0
+    return resp.EncodeInteger(1)
+}
+```
+
+---
+
+### Auto-Deletion: Passive vs Active Expiry
+
+Redis uses **two strategies** for expiring keys:
+
+#### 1. Passive Expiry (Lazy Deletion)
+
+**When:** Key is accessed (GET, SET, etc.)
+
+**Already implemented:** Our GET command checks expiration before returning
+
+```go
+// In GET command
+if obj.ExpiresAt > 0 && time.Now().UnixMilli() >= obj.ExpiresAt {
+    delete(store, key)
+    return resp.EncodeBulkString("")
+}
+```
+
+**Advantage:** No background overhead
+**Disadvantage:** Keys not accessed remain in memory
+
+---
+
+#### 2. Active Expiry (Background Deletion)
+
+**When:** Periodically in background
+
+**Redis Strategy:**
+1. Sample N random keys with expiration
+2. Delete all expired keys found
+3. If >25% were expired, repeat
+
+**Implementation:**
+
+```go
+// Background goroutine for active expiry
+func startActiveExpiry() {
+    ticker := time.NewTicker(100 * time.Millisecond)
+
+    go func() {
+        for range ticker.C {
+            deleteExpiredKeys()
+        }
+    }()
+}
+
+func deleteExpiredKeys() {
+    const sampleSize = 20
+    const expiryThreshold = 0.25
+
+    now := time.Now().UnixMilli()
+
+    for {
+        expiredCount := 0
+        sampledCount := 0
+
+        // Sample random keys with expiration
+        for key, obj := range store {
+            if obj.ExpiresAt == 0 {
+                continue  // Skip keys without expiration
+            }
+
+            sampledCount++
+
+            if now >= obj.ExpiresAt {
+                delete(store, key)
+                expiredCount++
+            }
+
+            if sampledCount >= sampleSize {
+                break
+            }
+        }
+
+        // Stop if we didn't find enough expired keys
+        if sampledCount == 0 || float64(expiredCount)/float64(sampledCount) < expiryThreshold {
+            break
+        }
+    }
+}
+```
+
+**Explanation:**
+1. Every 100ms, sample up to 20 random keys
+2. Delete expired ones
+3. If ≥25% were expired, likely more exist → sample again
+4. Continue until <25% expired
+
+**Why 25% threshold?**
+- Balance between CPU usage and memory cleanup
+- Redis's tested heuristic
+
+---
+
+### Optimized Expiry Tracking
+
+**Problem:** Scanning entire store is inefficient
+
+**Solution:** Maintain separate index of keys with expiration
+
+```go
+var store = make(map[string]*Object)
+var expiryIndex = make(map[string]int64)  // key -> expiresAt
+
+func setExpiry(key string, expiresAt int64) {
+    if obj, exists := store[key]; exists {
+        obj.ExpiresAt = expiresAt
+        if expiresAt > 0 {
+            expiryIndex[key] = expiresAt
+        } else {
+            delete(expiryIndex, key)
+        }
+    }
+}
+
+func deleteExpiredKeys() {
+    const sampleSize = 20
+    const expiryThreshold = 0.25
+
+    now := time.Now().UnixMilli()
+
+    for {
+        expiredCount := 0
+        sampledCount := 0
+
+        // Sample from expiry index only
+        for key, expiresAt := range expiryIndex {
+            sampledCount++
+
+            if now >= expiresAt {
+                delete(store, key)
+                delete(expiryIndex, key)
+                expiredCount++
+            }
+
+            if sampledCount >= sampleSize {
+                break
+            }
+        }
+
+        if sampledCount == 0 || float64(expiredCount)/float64(sampledCount) < expiryThreshold {
+            break
+        }
+    }
+}
+```
+
+---
+
+### Testing Expiration
+
+**Test Active Expiry:**
+```bash
+# Set 100 keys with 1-second expiration
+127.0.0.1:7379> for i in {1..100}; do redis-cli SET key$i value EX 1; done
+
+# Check key count
+127.0.0.1:7379> DBSIZE
+(integer) 100
+
+# Wait 2 seconds
+# Active expiry should delete them
+
+# Check again
+127.0.0.1:7379> DBSIZE
+(integer) 0
+```
+
+---
+
+## Chapter 11: Eviction Strategies and Implementing Simple-First
+
+### Why Eviction?
+
+**Problem:** Redis is an in-memory database. What happens when memory is full?
+
+**Options:**
+1. **Reject new writes** (noeviction)
+2. **Evict existing keys** (various policies)
+
+---
+
+### Redis Eviction Policies
+
+#### 1. noeviction (Default)
+
+**Behavior:** Return errors for write commands when memory limit reached
+
+```bash
+SET key value
+-OOM command not allowed when used memory > 'maxmemory'
+```
+
+#### 2. allkeys-random
+
+**Behavior:** Evict random keys from entire keyspace
+
+**Use Case:** All keys equally important, no pattern to access
+
+#### 3. allkeys-lru
+
+**Behavior:** Evict least recently used keys (any key)
+
+**Use Case:** Some keys accessed more frequently than others
+
+#### 4. allkeys-lfu
+
+**Behavior:** Evict least frequently used keys
+
+**Use Case:** Track access frequency, not recency
+
+#### 5. volatile-random
+
+**Behavior:** Evict random keys among those with TTL
+
+**Use Case:** Only evict temporary data
+
+#### 6. volatile-lru
+
+**Behavior:** LRU among keys with TTL
+
+#### 7. volatile-lfu
+
+**Behavior:** LFU among keys with TTL
+
+#### 8. volatile-ttl
+
+**Behavior:** Evict keys with shortest TTL first
+
+---
+
+### Configuration
+
+```go
+type EvictionPolicy int
+
+const (
+    NoEviction EvictionPolicy = iota
+    AllKeysRandom
+    AllKeysLRU
+    AllKeysLFU
+    VolatileRandom
+    VolatileLRU
+    VolatileLFU
+    VolatileTTL
+)
+
+var config = struct {
+    MaxMemory      int64
+    EvictionPolicy EvictionPolicy
+}{
+    MaxMemory:      100 * 1024 * 1024,  // 100 MB
+    EvictionPolicy: NoEviction,
+}
+```
+
+---
+
+### Memory Tracking
+
+**Problem:** How do we know when memory limit is reached?
+
+**Solution:** Track allocated memory
+
+```go
+var usedMemory int64
+
+func trackMemoryAlloc(size int64) {
+    atomic.AddInt64(&usedMemory, size)
+}
+
+func trackMemoryFree(size int64) {
+    atomic.AddInt64(&usedMemory, -size)
+}
+
+func getUsedMemory() int64 {
+    return atomic.LoadInt64(&usedMemory)
+}
+
+func isMemoryFull() bool {
+    if config.MaxMemory == 0 {
+        return false  // No limit
+    }
+    return getUsedMemory() >= config.MaxMemory
+}
+```
+
+**Tracking allocations:**
+```go
+func storeKey(key string, obj *Object) {
+    // Calculate size
+    size := int64(len(key)) + getObjectSize(obj)
+
+    store[key] = obj
+    trackMemoryAlloc(size)
+}
+
+func deleteKey(key string) {
+    if obj, exists := store[key]; exists {
+        size := int64(len(key)) + getObjectSize(obj)
+        delete(store, key)
+        trackMemoryFree(size)
+    }
+}
+```
+
+---
+
+### Implementing allkeys-random (Simple-First Eviction)
+
+**Simplest eviction policy:** Pick random keys and delete them
+
+```go
+func evictKeysRandom(count int) int {
+    evicted := 0
+
+    for key := range store {
+        deleteKey(key)
+        evicted++
+
+        if evicted >= count {
+            break
+        }
+    }
+
+    return evicted
+}
+```
+
+**Triggering eviction:**
+```go
+func ensureMemoryLimit() error {
+    if !isMemoryFull() {
+        return nil
+    }
+
+    if config.EvictionPolicy == NoEviction {
+        return errors.New("OOM command not allowed when used memory > 'maxmemory'")
+    }
+
+    // Evict keys until memory is below limit
+    for isMemoryFull() {
+        evicted := evictKeysRandom(10)  // Evict 10 at a time
+
+        if evicted == 0 {
+            // No keys left to evict
+            return errors.New("OOM unable to evict keys")
+        }
+    }
+
+    return nil
+}
+```
+
+**Integrate with SET command:**
+```go
+func evalSET(args []string) []byte {
+    // ... parse arguments ...
+
+    // Check memory before setting
+    if err := ensureMemoryLimit(); err != nil {
+        return resp.EncodeError("ERR " + err.Error())
+    }
+
+    // Proceed with SET
+    storeKey(key, &Object{
+        Value:     value,
+        Type:      TypeString,
+        ExpiresAt: expiryMs,
+    })
+
+    return resp.EncodeSimpleString("OK")
+}
+```
+
+---
+
+### Testing Eviction
+
+**Configure memory limit:**
+```bash
+CONFIG SET maxmemory 1mb
+CONFIG SET maxmemory-policy allkeys-random
+```
+
+**Fill memory:**
+```bash
+# Insert keys until memory full
+for i in {1..10000}; do
+    redis-cli SET key$i "$(head -c 1000 /dev/urandom | base64)"
+done
+```
+
+**Observe eviction:**
+```bash
+INFO memory
+# used_memory: 1048576
+# evicted_keys: 245
+```
+
+---
+
+### Summary
+
+**What We Implemented:**
+1. ✅ GET/SET/TTL commands
+2. ✅ DEL/EXPIRE/PERSIST commands
+3. ✅ Passive expiry (lazy deletion)
+4. ✅ Active expiry (background deletion)
+5. ✅ Memory tracking
+6. ✅ Simple random eviction
+
+**Key Concepts:**
+- **Object Structure**: Store values with metadata
+- **Expiration Index**: Track keys with TTL for efficient scanning
+- **Two-Phase Expiry**: Passive + Active
+- **Memory Limits**: Track usage, enforce limits
+- **Eviction Policies**: Balance between performance and fairness
+
+**Next:** Implement more sophisticated eviction (LRU, LFU)
+
+---
+
