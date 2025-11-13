@@ -16285,3 +16285,978 @@ public String robustGet(String key) {
 This completes Chapter 41 on Java/Jedis integration with production patterns demonstrating real-world Redis usage in high-scale systems.
 
 ---
+---
+
+## Chapter 41 (Continued): Advanced Production Patterns
+
+### Redis Key Deletion Mechanisms
+
+Understanding how Redis handles key expiration and deletion is critical for memory management and performance tuning.
+
+#### 1. Lazy (On-Access) Expiration
+
+Redis checks TTL when you access a key. If expired, it's deleted immediately.
+
+**Internal C code flow:**
+```c
+int expireIfNeeded(redisDb *db, robj *key) {
+    /* look up the key's expire time in the expires dict */
+    if (ttl <= 0) {
+        /* key has expired: remove it */
+        dbSyncDelete(db, key);
+        return 1;   /* tell caller "key not found" */
+    }
+    return 0;       /* key still valid */
+}
+```
+
+**Characteristics:**
+- Triggered on GET, HGET, EXPIRE, etc.
+- **Synchronous deletion** - memory freed immediately
+- Guarantees you never observe an expired key
+- Source: [Redis expire.c#L143-L164](https://github.com/redis/redis/blob/unstable/src/expire.c#L143-L164)
+
+#### 2. Active (Periodic) Expiration
+
+Background process runs 10 times per second to sample and delete expired keys.
+
+**Internal algorithm:**
+```c
+void activeExpireCycle(int type) {
+    /* for each non-empty database */
+    for (db = 0; db < server.dbnum; db++) {
+        int expired = 0, total = dictSize(db->expires);
+        
+        /* sample up to server.active_expire_cycle_keys keys */
+        while (timers_not_exhausted && sampled < MAX_SAMPLE) {
+            key = randomExpireKey(db);
+            if (key_expired) {
+                dbSyncDelete(db, key);
+                expired++;
+            }
+            sampled++;
+            
+            /* if more than 25% still valid, break early */
+            if (expired * 4 < sampled) break;
+        }
+    }
+}
+```
+
+**Process:**
+1. **Sampling**: Default 20 keys from expires set
+2. **Threshold**: Stops if <25% expired (caught up)
+3. **Synchronous deletes** for found expired keys
+4. Balances memory reclaim vs CPU usage
+
+Source: [Redis expire.c#L252-L300](https://github.com/redis/redis/blob/unstable/src/expire.c#L252-L300)
+
+#### 3. DEL vs UNLINK
+
+| Command | Removal | Memory Freeing | Use Case |
+|---------|---------|----------------|----------|
+| `DEL key` | Immediate | **Synchronous** (main thread) | Small keys, low latency tolerance |
+| `UNLINK key` | Immediate | **Asynchronous** (background thread) | Large keys (huge lists/hashes) |
+
+**Implementation details:**
+- **`dbSyncDelete`**: Walks object recursively, frees immediately on main thread
+- **`dbAsyncDelete`**: Unlinks dict entry, hands to background thread pool (bio)
+
+**Java Example:**
+
+```java
+@Service
+public class RedisDeletionService {
+    
+    private final Jedis jedis;
+    
+    /**
+     * Synchronous delete - blocks until memory freed
+     * Use for small keys
+     */
+    public void deleteSyncSmall(String key) {
+        jedis.del(key);
+        // Blocks until key fully deleted and memory freed
+    }
+    
+    /**
+     * Asynchronous delete - returns immediately
+     * Use for large keys to avoid blocking main thread
+     */
+    public void deleteAsyncLarge(String key) {
+        jedis.unlink(key);
+        // Returns immediately, memory freed in background
+    }
+    
+    /**
+     * Smart deletion based on key type/size
+     */
+    public void smartDelete(String key) {
+        String type = jedis.type(key);
+        
+        switch (type) {
+            case "list":
+            case "set":
+            case "zset":
+            case "hash":
+                // Potentially large - use UNLINK
+                Long size = getApproximateSize(key, type);
+                if (size > 1000) {
+                    jedis.unlink(key);
+                } else {
+                    jedis.del(key);
+                }
+                break;
+            case "string":
+            default:
+                // Strings are usually small
+                jedis.del(key);
+                break;
+        }
+    }
+    
+    private Long getApproximateSize(String key, String type) {
+        switch (type) {
+            case "list": return jedis.llen(key);
+            case "set": return jedis.scard(key);
+            case "zset": return jedis.zcard(key);
+            case "hash": return jedis.hlen(key);
+            default: return 0L;
+        }
+    }
+}
+```
+
+**Why this design:**
+- Expired keys always use **synchronous** frees (small batches, bounded cost)
+- **UNLINK** for huge keys prevents event loop stalls
+- Mixing async into expire cycle would complicate memory tracking
+
+---
+
+### Cache Penetration Prevention
+
+**Definition:** Malicious queries for non-existent data bypass cache, hitting database directly.
+
+**Dangers:**
+- Database overload from useless queries
+- Resource exhaustion (CPU, connections)
+- DoS vector - "silent killer" attacking database
+
+#### Strategy 1: Cache Empty Objects
+
+```java
+@Service
+public class CachePenetrationService {
+    
+    private final Jedis jedis;
+    private final UserRepository userRepo;
+    private static final String EMPTY_MARKER = "::EMPTY::";
+    private static final int EMPTY_TTL = 300; // 5 minutes
+    
+    public User getUser(Long userId) {
+        String key = "user:" + userId;
+        
+        // Check cache
+        String cached = jedis.get(key);
+        
+        // Empty marker found - data doesn't exist
+        if (EMPTY_MARKER.equals(cached)) {
+            return null;
+        }
+        
+        // Cache hit
+        if (cached != null) {
+            return deserialize(cached);
+        }
+        
+        // Cache miss - query database
+        User user = userRepo.findById(userId);
+        
+        if (user != null) {
+            // User exists - cache it
+            jedis.setex(key, 3600, serialize(user));
+        } else {
+            // User doesn't exist - cache empty marker
+            jedis.setex(key, EMPTY_TTL, EMPTY_MARKER);
+        }
+        
+        return user;
+    }
+    
+    /**
+     * Invalidate empty marker when user is created
+     */
+    public void onUserCreated(Long userId) {
+        String key = "user:" + userId;
+        jedis.del(key); // Remove empty marker
+    }
+}
+```
+
+**Pros:**
+- Future requests hit cache (not database)
+- Simple and effective
+
+**Cons:**
+- Consumes cache memory
+- Requires TTL management
+- Need invalidation strategy
+
+#### Strategy 2: Bloom Filter
+
+```java
+@Service
+public class BloomFilterPenetrationService {
+    
+    private final Jedis jedis;
+    private final UserRepository userRepo;
+    private static final String BLOOM_KEY = "users:bloom";
+    
+    /**
+     * Initialize Bloom filter with all valid user IDs
+     */
+    @PostConstruct
+    public void initializeBloomFilter() {
+        // Create bloom filter (1% error rate, 10M capacity)
+        jedis.sendCommand(
+            Protocol.Command.valueOf("BF.RESERVE"),
+            BLOOM_KEY,
+            "0.01",
+            "10000000"
+        );
+        
+        // Load all valid user IDs
+        List<Long> userIds = userRepo.findAllIds();
+        for (Long userId : userIds) {
+            jedis.sendCommand(
+                Protocol.Command.valueOf("BF.ADD"),
+                BLOOM_KEY,
+                userId.toString()
+            );
+        }
+    }
+    
+    public User getUser(Long userId) {
+        // First check: Bloom filter
+        boolean mightExist = checkBloomFilter(userId);
+        
+        if (!mightExist) {
+            // Definitely doesn't exist - no database query
+            return null;
+        }
+        
+        // Might exist - proceed with cache/database lookup
+        String key = "user:" + userId;
+        String cached = jedis.get(key);
+        
+        if (cached != null) {
+            return deserialize(cached);
+        }
+        
+        // Query database
+        User user = userRepo.findById(userId);
+        if (user != null) {
+            jedis.setex(key, 3600, serialize(user));
+        }
+        
+        return user;
+    }
+    
+    private boolean checkBloomFilter(Long userId) {
+        List<Long> result = (List<Long>) jedis.sendCommand(
+            Protocol.Command.valueOf("BF.EXISTS"),
+            BLOOM_KEY,
+            userId.toString()
+        );
+        return result.get(0) == 1;
+    }
+    
+    /**
+     * Add new user to Bloom filter
+     */
+    public void onUserCreated(User user) {
+        jedis.sendCommand(
+            Protocol.Command.valueOf("BF.ADD"),
+            BLOOM_KEY,
+            user.getId().toString()
+        );
+    }
+}
+```
+
+**Pros:**
+- Extremely memory efficient (10 bits per element)
+- Fast first line of defense
+- Handles massive key spaces
+
+**Cons:**
+- Small false positive rate (might allow some invalid queries through)
+- Cannot remove elements
+- Requires pre-loading or incremental updates
+
+#### Strategy 3: Rate Limiting
+
+```java
+@Component
+public class RateLimitInterceptor implements HandlerInterceptor {
+    
+    private final Jedis jedis;
+    
+    @Override
+    public boolean preHandle(HttpServletRequest request, 
+                            HttpServletResponse response, 
+                            Object handler) {
+        String clientIp = getClientIp(request);
+        String endpoint = request.getRequestURI();
+        
+        boolean allowed = checkRateLimit(clientIp, endpoint, 100, 60);
+        
+        if (!allowed) {
+            response.setStatus(429); // Too Many Requests
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Sliding window rate limiter
+     */
+    private boolean checkRateLimit(String clientId, String endpoint, 
+                                   int limit, int windowSeconds) {
+        String key = "rate_limit:" + endpoint + ":" + clientId;
+        long now = System.currentTimeMillis() / 1000;
+        
+        // Lua script for atomic rate limiting
+        String script =
+            "redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])\n" +
+            "local current = redis.call('ZCARD', KEYS[1])\n" +
+            "if current < tonumber(ARGV[3]) then\n" +
+            "    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[1])\n" +
+            "    redis.call('EXPIRE', KEYS[1], ARGV[2])\n" +
+            "    return 1\n" +
+            "else\n" +
+            "    return 0\n" +
+            "end";
+        
+        Object result = jedis.eval(
+            script,
+            Collections.singletonList(key),
+            Arrays.asList(
+                String.valueOf(now),
+                String.valueOf(windowSeconds),
+                String.valueOf(limit)
+            )
+        );
+        
+        return ((Long) result) == 1;
+    }
+}
+```
+
+---
+
+### Performance Optimization Patterns
+
+#### Pattern 1: Pipeline vs Individual Commands
+
+**Bad approach - N round trips:**
+
+```java
+// SLOW: 1000 network round trips
+for (String key : keys) {
+    jedis.get(key); // Each call = 1 RTT (~1ms)
+}
+// Total time: ~1000ms
+```
+
+**Good approach - Pipelining (1 round trip):**
+
+```java
+// FAST: 1 network round trip for all commands
+Pipeline pipeline = jedis.pipelined();
+List<Response<String>> responses = new ArrayList<>();
+
+for (String key : keys) {
+    responses.add(pipeline.get(key));
+}
+
+pipeline.sync(); // Execute all commands
+
+// Process responses
+for (Response<String> response : responses) {
+    String value = response.get();
+    // Use value...
+}
+// Total time: ~2ms (50x faster!)
+```
+
+#### Pattern 2: MSET/MGET Bulk Operations
+
+```java
+@Service
+public class BulkOperationsService {
+    
+    private final Jedis jedis;
+    
+    /**
+     * SLOW: Individual SETs
+     * Time: N × RTT
+     */
+    public void slowBatchSet(Map<String, String> keyValues) {
+        for (Map.Entry<String, String> entry : keyValues.entrySet()) {
+            jedis.set(entry.getKey(), entry.getValue());
+            // Each SET = 1 round trip
+        }
+    }
+    
+    /**
+     * FAST: MSET batch operation
+     * Time: 1 × RTT
+     */
+    public void fastBatchSet(Map<String, String> keyValues) {
+        String[] keysAndValues = keyValues.entrySet().stream()
+            .flatMap(e -> Stream.of(e.getKey(), e.getValue()))
+            .toArray(String[]::new);
+        
+        jedis.mset(keysAndValues);
+        // Single round trip for all keys
+    }
+    
+    /**
+     * SLOW: Individual GETs
+     */
+    public Map<String, String> slowBatchGet(List<String> keys) {
+        Map<String, String> result = new HashMap<>();
+        for (String key : keys) {
+            result.put(key, jedis.get(key));
+        }
+        return result;
+    }
+    
+    /**
+     * FAST: MGET batch operation
+     */
+    public Map<String, String> fastBatchGet(List<String> keys) {
+        List<String> values = jedis.mget(keys.toArray(new String[0]));
+        
+        Map<String, String> result = new HashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            result.put(keys.get(i), values.get(i));
+        }
+        return result;
+    }
+}
+```
+
+**Performance comparison (1000 keys):**
+- Individual SETs: ~1000ms (1ms RTT × 1000)
+- MSET: ~2ms
+- **Speedup: 500x**
+
+#### Pattern 3: Use Hashes Instead of Many Keys
+
+```java
+@Service
+public class HashOptimizationService {
+    
+    /**
+     * ANTI-PATTERN: Many individual keys
+     * Memory overhead: ~56 bytes per key
+     * 100 fields = 5600 bytes overhead
+     */
+    public void antiPatternManyKeys(Long userId, UserProfile profile) {
+        jedis.set("user:" + userId + ":name", profile.getName());
+        jedis.set("user:" + userId + ":email", profile.getEmail());
+        jedis.set("user:" + userId + ":age", String.valueOf(profile.getAge()));
+        // ... 100 more fields
+        // Total memory: ~5600 bytes overhead + data
+    }
+    
+    /**
+     * BEST PRACTICE: Single hash with fields
+     * Memory overhead: ~24 bytes per field
+     * 100 fields = 2400 bytes overhead (58% less!)
+     */
+    public void bestPracticeHash(Long userId, UserProfile profile) {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("name", profile.getName());
+        fields.put("email", profile.getEmail());
+        fields.put("age", String.valueOf(profile.getAge()));
+        // ... 100 more fields
+        
+        jedis.hset("user:" + userId, fields);
+        // Total memory: ~2400 bytes overhead + data
+    }
+    
+    /**
+     * Retrieve specific fields only (efficient)
+     */
+    public String getUserEmail(Long userId) {
+        return jedis.hget("user:" + userId, "email");
+        // O(1) field access
+    }
+    
+    /**
+     * Atomic field operations
+     */
+    public void incrementLoginCount(Long userId) {
+        jedis.hincrBy("user:" + userId, "login_count", 1);
+    }
+}
+```
+
+#### Pattern 4: MULTI/EXEC Transactions
+
+```java
+@Service
+public class TransactionService {
+    
+    private final Jedis jedis;
+    
+    /**
+     * Atomic transaction: Transfer credits between users
+     */
+    public boolean transferCredits(Long fromUserId, Long toUserId, int amount) {
+        String fromKey = "user:" + fromUserId + ":credits";
+        String toKey = "user:" + toUserId + ":credits";
+        
+        Transaction tx = jedis.multi();
+        
+        // Queue commands
+        tx.decrBy(fromKey, amount);
+        tx.incrBy(toKey, amount);
+        
+        // Execute atomically
+        List<Object> results = tx.exec();
+        
+        return results != null; // null = transaction failed
+    }
+    
+    /**
+     * Complex atomic operation with multiple keys
+     */
+    public void processOrder(Order order) {
+        Transaction tx = jedis.multi();
+        
+        // Decrement inventory
+        tx.hincrBy("inventory", "product:" + order.getProductId(), -order.getQuantity());
+        
+        // Add to orders
+        tx.lpush("orders:pending", order.toJson());
+        
+        // Update user stats
+        tx.hincrBy("user:" + order.getUserId(), "total_orders", 1);
+        tx.hincrBy("user:" + order.getUserId(), "total_spent", order.getAmount());
+        
+        // Execute all or nothing
+        tx.exec();
+    }
+}
+```
+
+---
+
+### Binary Serialization with Protostuff + Snappy
+
+**Problem with JSON:**
+- High memory overhead (field names repeated)
+- Slower serialization/deserialization
+- Large network payloads
+
+**Solution: Binary serialization + compression**
+
+#### Maven Dependencies
+
+```xml
+<dependencies>
+    <!-- Protostuff -->
+    <dependency>
+        <groupId>io.protostuff</groupId>
+        <artifactId>protostuff-core</artifactId>
+        <version>1.8.0</version>
+    </dependency>
+    <dependency>
+        <groupId>io.protostuff</groupId>
+        <artifactId>protostuff-runtime</artifactId>
+        <version>1.8.0</version>
+    </dependency>
+    
+    <!-- Snappy Compression -->
+    <dependency>
+        <groupId>org.xerial.snappy</groupId>
+        <artifactId>snappy-java</artifactId>
+        <version>1.1.10.5</version>
+    </dependency>
+</dependencies>
+```
+
+#### Implementation
+
+```java
+import io.protostuff.LinkedBuffer;
+import io.protostuff.ProtostuffIOUtil;
+import io.protostuff.runtime.RuntimeSchema;
+import org.xerial.snappy.Snappy;
+import redis.clients.jedis.Jedis;
+
+@Service
+public class BinarySerializationService {
+    
+    private final Jedis jedis;
+    
+    // Schema cached per class
+    private static final RuntimeSchema<User> USER_SCHEMA = 
+        RuntimeSchema.createFrom(User.class);
+    
+    /**
+     * Store object with binary serialization + compression
+     */
+    public void storeUser(Long userId, User user) throws Exception {
+        String key = "user:" + userId;
+        
+        // 1. Serialize to binary with Protostuff
+        LinkedBuffer buffer = LinkedBuffer.allocate(
+            LinkedBuffer.DEFAULT_BUFFER_SIZE
+        );
+        byte[] serialized = ProtostuffIOUtil.toByteArray(
+            user, 
+            USER_SCHEMA, 
+            buffer
+        );
+        
+        // 2. Compress with Snappy
+        byte[] compressed = Snappy.compress(serialized);
+        
+        // 3. Store in Redis
+        jedis.setex(key.getBytes(), 3600, compressed);
+        
+        // Cleanup
+        buffer.clear();
+    }
+    
+    /**
+     * Retrieve object with decompression + deserialization
+     */
+    public User getUser(Long userId) throws Exception {
+        String key = "user:" + userId;
+        
+        // 1. Get from Redis
+        byte[] compressed = jedis.get(key.getBytes());
+        if (compressed == null) {
+            return null;
+        }
+        
+        // 2. Decompress
+        byte[] serialized = Snappy.uncompress(compressed);
+        
+        // 3. Deserialize
+        User user = USER_SCHEMA.newMessage();
+        ProtostuffIOUtil.mergeFrom(serialized, user, USER_SCHEMA);
+        
+        return user;
+    }
+    
+    /**
+     * Bulk insert with pipeline + binary + compression
+     */
+    public void bulkInsertUsers(Map<Long, User> users) throws Exception {
+        Pipeline pipeline = jedis.pipelined();
+        LinkedBuffer buffer = LinkedBuffer.allocate(
+            LinkedBuffer.DEFAULT_BUFFER_SIZE
+        );
+        
+        for (Map.Entry<Long, User> entry : users.entrySet()) {
+            String key = "user:" + entry.getKey();
+            
+            // Serialize + compress
+            byte[] serialized = ProtostuffIOUtil.toByteArray(
+                entry.getValue(),
+                USER_SCHEMA,
+                buffer
+            );
+            byte[] compressed = Snappy.compress(serialized);
+            
+            // Queue in pipeline
+            pipeline.setex(key.getBytes(), 3600, compressed);
+            
+            buffer.clear();
+        }
+        
+        // Execute all in one round trip
+        pipeline.sync();
+    }
+    
+    // User class (requires default constructor)
+    public static class User {
+        public String name;
+        public String email;
+        public int age;
+        public List<String> tags;
+        
+        public User() {} // Required for Protostuff
+    }
+}
+```
+
+#### Performance Comparison
+
+**Test: 10,000 User objects (100 bytes average)**
+
+| Approach | Serialization Time | Size (KB) | Network Transfer |
+|----------|-------------------|-----------|------------------|
+| JSON (Gson) | 450ms | 1200 KB | 1200 KB |
+| Protostuff | 120ms | 600 KB | 600 KB |
+| Protostuff + Snappy | 150ms | 280 KB | 280 KB |
+
+**Benefits:**
+- **Protostuff**: 73% faster serialization, 50% smaller
+- **+ Snappy**: 77% less network transfer
+- Total speedup: ~3-4x end-to-end
+
+---
+
+### Bloom Filter vs Bitmap
+
+**When to use each:**
+
+| Use Case | Bloom Filter | Bitmap |
+|----------|-------------|--------|
+| **Membership test (billions of items)** | ✅ Excellent (10 bits/item) | ❌ Too large (1 bit/item still huge) |
+| **Membership test (millions of items)** | ✅ Good | ✅ Better if sequential IDs |
+| **Exact membership (no false positives)** | ❌ Has false positives | ✅ Exact |
+| **Deletion support** | ❌ Cannot delete | ✅ Can delete |
+| **Counting set bits** | ❌ No | ✅ BITCOUNT |
+| **Set operations (AND, OR, XOR)** | ✅ Merge with OR | ✅ BITOP |
+| **Sequential/sparse data** | ❌ No benefit | ✅ Excellent for sparse |
+
+**Java Example:**
+
+```java
+@Service
+public class BloomVsBitmapService {
+    
+    private final Jedis jedis;
+    
+    /**
+     * Use Bloom Filter: Large universe, probabilistic OK
+     * Example: Track email addresses seen (billions possible)
+     */
+    public void trackEmailBloom(String email) {
+        String bloomKey = "emails:seen";
+        
+        // Check if seen
+        boolean seen = checkBloom(bloomKey, email);
+        
+        if (!seen) {
+            // First time seeing this email
+            addToBloom(bloomKey, email);
+            processNewEmail(email);
+        }
+    }
+    
+    /**
+     * Use Bitmap: Sequential IDs, exact membership needed
+     * Example: Track user login status (user IDs 1-10M)
+     */
+    public void trackUserLoginBitmap(Long userId) {
+        String bitmapKey = "users:logged_in:today";
+        
+        // Set bit for this user
+        jedis.setbit(bitmapKey, userId, true);
+        jedis.expire(bitmapKey, 86400); // Expire in 24h
+    }
+    
+    /**
+     * Check if user logged in today
+     */
+    public boolean isUserLoggedIn(Long userId) {
+        return jedis.getbit("users:logged_in:today", userId);
+    }
+    
+    /**
+     * Count total logins today
+     */
+    public long getTotalLoginsToday() {
+        return jedis.bitcount("users:logged_in:today");
+    }
+    
+    /**
+     * Find users who logged in both days (AND operation)
+     */
+    public long getUsersLoggedInBothDays(String day1, String day2) {
+        String resultKey = "users:both_days";
+        
+        jedis.bitop(BitOP.AND, resultKey, 
+            "users:logged_in:" + day1,
+            "users:logged_in:" + day2
+        );
+        
+        return jedis.bitcount(resultKey);
+    }
+}
+```
+
+---
+
+### Using redis-benchmark
+
+**Basic usage:**
+
+```bash
+# Test SET performance (100K requests, 50 parallel)
+redis-benchmark -t set -n 100000 -c 50
+
+# Test GET performance
+redis-benchmark -t get -n 100000 -c 50
+
+# Test pipeline (16 commands per pipeline)
+redis-benchmark -t set -n 100000 -c 50 -P 16
+
+# Test specific key size
+redis-benchmark -t set -n 100000 -d 1024  # 1KB values
+
+# Test against remote Redis
+redis-benchmark -h redis.example.com -p 6379 -a password -n 100000
+```
+
+**Comprehensive benchmark script:**
+
+```bash
+#!/bin/bash
+
+echo "=== Redis Benchmark Suite ==="
+
+# Single operation tests
+echo "1. Testing SET..."
+redis-benchmark -t set -n 100000 -c 50 -q
+
+echo "2. Testing GET..."
+redis-benchmark -t get -n 100000 -c 50 -q
+
+echo "3. Testing INCR..."
+redis-benchmark -t incr -n 100000 -c 50 -q
+
+echo "4. Testing LPUSH..."
+redis-benchmark -t lpush -n 100000 -c 50 -q
+
+echo "5. Testing LPOP..."
+redis-benchmark -t lpop -n 100000 -c 50 -q
+
+# Pipeline tests
+echo "6. Testing SET with pipeline (16 cmds)..."
+redis-benchmark -t set -n 100000 -c 50 -P 16 -q
+
+echo "7. Testing GET with pipeline (16 cmds)..."
+redis-benchmark -t get -n 100000 -c 50 -P 16 -q
+
+# Different value sizes
+echo "8. Testing SET with 1KB values..."
+redis-benchmark -t set -n 100000 -c 50 -d 1024 -q
+
+echo "9. Testing SET with 10KB values..."
+redis-benchmark -t set -n 100000 -c 50 -d 10240 -q
+
+# MSET/MGET tests
+echo "10. Testing MSET..."
+redis-benchmark -t mset -n 100000 -c 50 -q
+```
+
+**Interpreting results:**
+
+```
+====== SET ======
+  100000 requests completed in 0.90 seconds
+  50 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+99.00% <= 1 milliseconds
+99.50% <= 2 milliseconds
+99.90% <= 3 milliseconds
+100.00% <= 4 milliseconds
+111111.11 requests per second
+```
+
+**Key metrics:**
+- **Throughput**: 111,111 requests/sec
+- **Latency percentiles**: P99 = 1ms, P99.9 = 3ms
+- **Conclusion**: Excellent performance
+
+**Java integration with benchmarking:**
+
+```java
+@Service
+public class RedisBenchmarkService {
+    
+    private final JedisPool jedisPool;
+    
+    /**
+     * Benchmark GET operations
+     */
+    public BenchmarkResult benchmarkGet(int iterations) {
+        long start = System.nanoTime();
+        
+        try (Jedis jedis = jedisPool.getResource()) {
+            for (int i = 0; i < iterations; i++) {
+                jedis.get("benchmark:key:" + (i % 1000));
+            }
+        }
+        
+        long duration = System.nanoTime() - start;
+        double opsPerSec = (iterations * 1_000_000_000.0) / duration;
+        double avgLatency = (duration / iterations) / 1_000_000.0; // ms
+        
+        return new BenchmarkResult(opsPerSec, avgLatency);
+    }
+    
+    /**
+     * Benchmark pipelined operations
+     */
+    public BenchmarkResult benchmarkPipeline(int iterations) {
+        long start = System.nanoTime();
+        
+        try (Jedis jedis = jedisPool.getResource()) {
+            Pipeline pipeline = jedis.pipelined();
+            
+            for (int i = 0; i < iterations; i++) {
+                pipeline.get("benchmark:key:" + (i % 1000));
+            }
+            
+            pipeline.sync();
+        }
+        
+        long duration = System.nanoTime() - start;
+        double opsPerSec = (iterations * 1_000_000_000.0) / duration;
+        double avgLatency = (duration / iterations) / 1_000_000.0;
+        
+        return new BenchmarkResult(opsPerSec, avgLatency);
+    }
+    
+    public static class BenchmarkResult {
+        public final double operationsPerSecond;
+        public final double averageLatencyMs;
+        
+        public BenchmarkResult(double opsPerSec, double latency) {
+            this.operationsPerSecond = opsPerSec;
+            this.averageLatencyMs = latency;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format(
+                "Throughput: %.2f ops/sec, Avg Latency: %.3f ms",
+                operationsPerSecond,
+                averageLatencyMs
+            );
+        }
+    }
+}
+```
+
+---
+
+This completes the comprehensive production patterns covering all advanced Redis usage scenarios with Java/Jedis.
+
+---
