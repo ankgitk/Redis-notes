@@ -7913,3 +7913,745 @@ func main() {
 **Next:** Transactions and MULTI/EXEC implementation
 
 ---
+## Chapter 21: Implementing Transactions (MULTI/EXEC)
+
+### What are Redis Transactions?
+
+**Redis transactions** allow grouping multiple commands into a single atomic unit that executes sequentially without interruption.
+
+**Key Characteristics:**
+- **Atomicity**: All commands execute together
+- **Isolation**: No other client commands interleave
+- **No rollback**: Failed commands don't revert transaction
+- **Simplicity**: Command queuing, not complex 2PC
+
+**Commands:**
+- `MULTI`: Begin transaction
+- `EXEC`: Commit and execute all queued commands
+- `DISCARD`: Abort transaction, clear queue
+
+---
+
+### Basic Transaction Flow
+
+**Example:**
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> SET user:1:name "Alice"
+QUEUED
+127.0.0.1:6379(TX)> SET user:1:age "30"
+QUEUED
+127.0.0.1:6379(TX)> INCR user:1:visits
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) OK
+2) OK
+3) (integer) 1
+```
+
+**Visual Flow:**
+
+```
+┌─────────────────────────────────────────────┐
+│ Client                                      │
+│                                             │
+│ MULTI ──────────────────────────> Server   │
+│         <─────────────────────── OK         │
+│                                             │
+│ SET user:1:name "Alice" ─────────> Server  │
+│         <─────────────────────── QUEUED    │
+│                                             │
+│ SET user:1:age "30" ──────────────> Server │
+│         <─────────────────────── QUEUED    │
+│                                             │
+│ INCR user:1:visits ───────────────> Server │
+│         <─────────────────────── QUEUED    │
+│                                             │
+│ EXEC ──────────────────────────────> Server│
+│         (execute all commands)              │
+│         <─────────────────────────┐        │
+│         Array of 3 responses:     │        │
+│         1) OK                     │        │
+│         2) OK                     │        │
+│         3) (integer) 1            │        │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+### Transactions vs Pipelining
+
+| Feature | Transactions (MULTI/EXEC) | Pipelining |
+|---------|--------------------------|------------|
+| **Atomicity** | ✅ Yes (all or nothing visibility) | ❌ No |
+| **Isolation** | ✅ Yes (no interleaving) | ❌ No |
+| **Rollback** | ❌ No | ❌ No |
+| **Performance** | Moderate (queuing overhead) | High (no queuing) |
+| **Use Case** | Consistent state updates | Bulk operations |
+
+**Example showing difference:**
+
+```bash
+# Transaction: Atomic transfer
+MULTI
+DECRBY account:A 100
+INCRBY account:B 100
+EXEC
+# Both execute together, or neither (if connection drops)
+
+# Pipeline: Independent commands
+SET key1 value1
+SET key2 value2
+GET key1
+# Execute independently, no atomicity guarantee
+```
+
+---
+
+### State Management for Transactions
+
+**Challenge:** Clients need to maintain transaction state
+
+**Solution:** Per-client state tracking
+
+#### Client Object Structure
+
+```go
+type Client struct {
+    FD             int              // File descriptor (socket)
+    CommandQueue   []*RedisCommand  // Queued commands during transaction
+    IsTransaction  bool             // Transaction mode flag
+    Buffer         []byte           // Response buffer
+}
+```
+
+#### Global Client Registry
+
+```go
+var connectedClients = make(map[int]*Client)
+
+func onClientConnect(fd int) {
+    client := &Client{
+        FD:            fd,
+        CommandQueue:  make([]*RedisCommand, 0),
+        IsTransaction: false,
+        Buffer:        make([]byte, 0, 4096),
+    }
+    connectedClients[fd] = client
+}
+
+func onClientDisconnect(fd int) {
+    delete(connectedClients, fd)
+    close(fd)
+}
+```
+
+**Why File Descriptor as Key?**
+- Unique per connection
+- Already available from epoll events
+- No need for session IDs
+
+---
+
+### Implementation
+
+#### 1. MULTI Command
+
+**Purpose:** Enter transaction mode
+
+```go
+func evalMULTI(client *Client, args []string) []byte {
+    if client.IsTransaction {
+        return resp.EncodeError("ERR MULTI calls can not be nested")
+    }
+
+    client.IsTransaction = true
+    client.CommandQueue = make([]*RedisCommand, 0)
+
+    return resp.EncodeSimpleString("OK")
+}
+```
+
+**Client State Change:**
+
+```
+Before:
+┌────────────────────┐
+│ Client             │
+│ IsTransaction: ❌  │
+│ CommandQueue: []   │
+└────────────────────┘
+
+After MULTI:
+┌────────────────────┐
+│ Client             │
+│ IsTransaction: ✅  │
+│ CommandQueue: []   │
+└────────────────────┘
+```
+
+---
+
+#### 2. Command Queuing
+
+**For clients in transaction mode, queue commands instead of executing:**
+
+```go
+func processCommand(client *Client, cmd *RedisCommand) []byte {
+    cmdName := strings.ToUpper(cmd.Args[0])
+
+    // Transaction control commands execute immediately
+    switch cmdName {
+    case "MULTI":
+        return evalMULTI(client, cmd.Args[1:])
+    case "EXEC":
+        return evalEXEC(client, cmd.Args[1:])
+    case "DISCARD":
+        return evalDISCARD(client, cmd.Args[1:])
+    }
+
+    // If in transaction mode, queue command
+    if client.IsTransaction {
+        client.CommandQueue = append(client.CommandQueue, cmd)
+        return resp.EncodeSimpleString("QUEUED")
+    }
+
+    // Normal execution
+    return executeCommand(cmd)
+}
+```
+
+**Queue Growth:**
+
+```
+MULTI
+┌────────────────────┐
+│ CommandQueue: []   │
+└────────────────────┘
+
+SET key1 val1
+┌────────────────────────────────┐
+│ CommandQueue: [SET key1 val1] │
+└────────────────────────────────┘
+
+SET key2 val2
+┌──────────────────────────────────────────────────┐
+│ CommandQueue: [SET key1 val1, SET key2 val2]    │
+└──────────────────────────────────────────────────┘
+
+GET key1
+┌─────────────────────────────────────────────────────────────────┐
+│ CommandQueue: [SET key1 val1, SET key2 val2, GET key1]         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 3. EXEC Command
+
+**Purpose:** Execute all queued commands atomically
+
+```go
+func evalEXEC(client *Client, args []string) []byte {
+    if !client.IsTransaction {
+        return resp.EncodeError("ERR EXEC without MULTI")
+    }
+
+    // Execute all queued commands
+    results := make([][]byte, 0, len(client.CommandQueue))
+
+    for _, cmd := range client.CommandQueue {
+        result := executeCommand(cmd)
+        results = append(results, result)
+    }
+
+    // Clear transaction state
+    client.IsTransaction = false
+    client.CommandQueue = nil
+
+    // Return array of results
+    return encodeArray(results)
+}
+
+func encodeArray(items [][]byte) []byte {
+    var buf bytes.Buffer
+
+    // Array header: *<count>\r\n
+    buf.WriteString(fmt.Sprintf("*%d\r\n", len(items)))
+
+    // Each item (already RESP encoded)
+    for _, item := range items {
+        buf.Write(item)
+    }
+
+    return buf.Bytes()
+}
+```
+
+**Execution Flow:**
+
+```
+CommandQueue: [SET key1 val1, SET key2 val2, GET key1]
+
+Execute SET key1 val1 → +OK\r\n
+Execute SET key2 val2 → +OK\r\n
+Execute GET key1      → $4\r\nval1\r\n
+
+Encode as array:
+*3\r\n
++OK\r\n
++OK\r\n
+$4\r\nval1\r\n
+```
+
+---
+
+#### 4. DISCARD Command
+
+**Purpose:** Abort transaction without executing
+
+```go
+func evalDISCARD(client *Client, args []string) []byte {
+    if !client.IsTransaction {
+        return resp.EncodeError("ERR DISCARD without MULTI")
+    }
+
+    // Clear transaction state
+    client.IsTransaction = false
+    client.CommandQueue = nil
+
+    return resp.EncodeSimpleString("OK")
+}
+```
+
+**Example:**
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> SET key1 value1
+QUEUED
+127.0.0.1:6379(TX)> SET key2 value2
+QUEUED
+127.0.0.1:6379(TX)> DISCARD
+OK
+127.0.0.1:6379> GET key1
+(nil)  # Commands were not executed
+```
+
+---
+
+### Isolation and Concurrency
+
+#### Single-Threaded Execution
+
+**Redis's single-threaded event loop ensures isolation:**
+
+```
+Time    Client A              Client B              Redis
+----    --------              --------              -----
+t=0     MULTI                                       Set A: IsTransaction=true
+t=1     SET key1 val1                               Queue in A
+t=2                           MULTI                  Set B: IsTransaction=true
+t=3     SET key2 val2                               Queue in A
+t=4                           SET key3 val3          Queue in B
+t=5     EXEC                                        Execute A's queue
+t=6                                                 ├─ SET key1 val1
+t=7                                                 ├─ SET key2 val2
+t=8                                                 └─ Return array
+t=9                           EXEC                  Execute B's queue
+t=10                                                ├─ SET key3 val3
+t=11                                                └─ Return array
+```
+
+**Key Point:** Client B's commands can't execute until Client A's transaction completes.
+
+---
+
+### No Rollback
+
+**Redis transactions do NOT support rollback:**
+
+```bash
+127.0.0.1:6379> SET balance 100
+OK
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> DECRBY balance 50
+QUEUED
+127.0.0.1:6379(TX)> INCR invalid_key
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) (integer) 50
+2) (integer) 1
+127.0.0.1:6379> GET balance
+"50"  # First command succeeded despite second command error
+```
+
+**Why No Rollback?**
+
+Redis philosophy:
+1. **Simplicity**: No undo log, no compensation logic
+2. **Performance**: No overhead for rollback tracking
+3. **Responsibility**: Application should validate before EXEC
+4. **Reality**: Errors in well-tested code are rare
+
+---
+
+### Error Handling
+
+#### Syntax Errors (Before EXEC)
+
+```bash
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> SET key value
+QUEUED
+127.0.0.1:6379(TX)> SET key  # Missing argument
+(error) ERR wrong number of arguments for 'SET' command
+127.0.0.1:6379(TX)> EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+```
+
+**Implementation:**
+
+```go
+type Client struct {
+    FD             int
+    CommandQueue   []*RedisCommand
+    IsTransaction  bool
+    HasError       bool  // Track syntax errors
+}
+
+func processCommand(client *Client, cmd *RedisCommand) []byte {
+    if client.IsTransaction {
+        // Validate command syntax
+        if err := validateCommand(cmd); err != nil {
+            client.HasError = true
+            return resp.EncodeError("ERR " + err.Error())
+        }
+
+        client.CommandQueue = append(client.CommandQueue, cmd)
+        return resp.EncodeSimpleString("QUEUED")
+    }
+    // ...
+}
+
+func evalEXEC(client *Client, args []string) []byte {
+    if !client.IsTransaction {
+        return resp.EncodeError("ERR EXEC without MULTI")
+    }
+
+    if client.HasError {
+        client.IsTransaction = false
+        client.CommandQueue = nil
+        client.HasError = false
+        return resp.EncodeError("EXECABORT Transaction discarded because of previous errors")
+    }
+
+    // Execute commands...
+}
+```
+
+---
+
+#### Runtime Errors (During EXEC)
+
+```bash
+127.0.0.1:6379> SET mykey "string_value"
+OK
+127.0.0.1:6379> MULTI
+OK
+127.0.0.1:6379(TX)> INCR mykey  # Will fail at runtime
+QUEUED
+127.0.0.1:6379(TX)> SET anotherkey "value"
+QUEUED
+127.0.0.1:6379(TX)> EXEC
+1) (error) ERR value is not an integer or out of range
+2) OK  # This command still executes!
+```
+
+**Key Point:** Runtime errors don't abort transaction
+
+---
+
+### WATCH for Optimistic Locking
+
+**Problem:** Transaction values may change between MULTI and EXEC
+
+```bash
+# Client A                      # Client B
+SET balance 100
+MULTI
+DECRBY balance 50
+                                SET balance 0  # Concurrent modification!
+EXEC
+# Balance is now -50 (incorrect!)
+```
+
+**Solution: WATCH command**
+
+```bash
+# Client A
+WATCH balance
+GET balance  # Read: 100
+MULTI
+DECRBY balance 50
+EXEC  # Aborts if balance changed since WATCH
+```
+
+**Implementation:**
+
+```go
+type Client struct {
+    FD            int
+    CommandQueue  []*RedisCommand
+    IsTransaction bool
+    WatchedKeys   map[string]uint64  // key -> version
+}
+
+var keyVersions = make(map[string]uint64)
+
+func evalWATCH(client *Client, args []string) []byte {
+    if client.IsTransaction {
+        return resp.EncodeError("ERR WATCH inside MULTI is not allowed")
+    }
+
+    for _, key := range args {
+        version, exists := keyVersions[key]
+        if !exists {
+            version = 0
+        }
+        client.WatchedKeys[key] = version
+    }
+
+    return resp.EncodeSimpleString("OK")
+}
+
+func onKeyModified(key string) {
+    keyVersions[key]++
+}
+
+func evalEXEC(client *Client, args []string) []byte {
+    if !client.IsTransaction {
+        return resp.EncodeError("ERR EXEC without MULTI")
+    }
+
+    // Check if watched keys changed
+    for key, watchedVersion := range client.WatchedKeys {
+        currentVersion := keyVersions[key]
+        if currentVersion != watchedVersion {
+            // Transaction aborted
+            client.IsTransaction = false
+            client.CommandQueue = nil
+            client.WatchedKeys = nil
+            return resp.EncodeNullArray()  // (nil)
+        }
+    }
+
+    // Execute commands...
+    results := make([][]byte, 0, len(client.CommandQueue))
+    for _, cmd := range client.CommandQueue {
+        result := executeCommand(cmd)
+        results = append(results, result)
+
+        // Update key versions for modified keys
+        for _, key := range cmd.ModifiedKeys {
+            onKeyModified(key)
+        }
+    }
+
+    // Clear state
+    client.IsTransaction = false
+    client.CommandQueue = nil
+    client.WatchedKeys = nil
+
+    return encodeArray(results)
+}
+```
+
+**WATCH Example:**
+
+```bash
+# Optimistic locking pattern
+WATCH balance
+balance = GET balance
+MULTI
+SET balance (balance - 50)
+result = EXEC
+
+if result is nil:
+    # Transaction aborted, retry
+else:
+    # Success
+```
+
+---
+
+### Testing Transactions
+
+**Test 1: Basic Transaction**
+
+```go
+func TestBasicTransaction(t *testing.T) {
+    conn := connectRedis()
+
+    conn.Send("MULTI")
+    conn.Send("SET", "key1", "value1")
+    conn.Send("SET", "key2", "value2")
+    conn.Send("GET", "key1")
+
+    results, _ := conn.Do("EXEC")
+
+    // results: [OK, OK, "value1"]
+    assert.Equal(t, 3, len(results))
+    assert.Equal(t, "OK", results[0])
+    assert.Equal(t, "value1", results[2])
+}
+```
+
+---
+
+**Test 2: Discard**
+
+```go
+func TestDiscard(t *testing.T) {
+    conn := connectRedis()
+
+    conn.Do("SET", "key", "original")
+
+    conn.Send("MULTI")
+    conn.Send("SET", "key", "modified")
+    conn.Do("DISCARD")
+
+    value, _ := conn.Do("GET", "key")
+    assert.Equal(t, "original", value)  // Not modified
+}
+```
+
+---
+
+**Test 3: Optimistic Locking with WATCH**
+
+```go
+func TestWatchSuccess(t *testing.T) {
+    conn := connectRedis()
+    conn.Do("SET", "counter", "0")
+
+    conn.Do("WATCH", "counter")
+    conn.Send("MULTI")
+    conn.Send("INCR", "counter")
+    results, _ := conn.Do("EXEC")
+
+    assert.NotNil(t, results)  // Transaction succeeded
+}
+
+func TestWatchAbort(t *testing.T) {
+    conn1 := connectRedis()
+    conn2 := connectRedis()
+
+    conn1.Do("SET", "counter", "0")
+    conn1.Do("WATCH", "counter")
+
+    // Concurrent modification
+    conn2.Do("INCR", "counter")
+
+    conn1.Send("MULTI")
+    conn1.Send("INCR", "counter")
+    results, _ := conn1.Do("EXEC")
+
+    assert.Nil(t, results)  // Transaction aborted
+}
+```
+
+---
+
+### Performance Considerations
+
+**Transaction Overhead:**
+
+| Operation | Time (ns) |
+|-----------|----------|
+| Normal SET | 50,000 |
+| MULTI | 5,000 |
+| Queue command | 1,000 |
+| EXEC (3 commands) | 160,000 |
+
+**Cost Breakdown:**
+- Queuing: ~1µs per command
+- Execution: Same as normal
+- Array encoding: ~5µs
+
+**Total: ~10-20% overhead for transactions**
+
+---
+
+### Use Cases
+
+**1. Atomic Counters**
+
+```bash
+MULTI
+INCR page:views
+INCR user:actions
+EXEC
+```
+
+---
+
+**2. Conditional Updates**
+
+```bash
+WATCH config:version
+version = GET config:version
+if version == expected_version:
+    MULTI
+    SET config:value new_value
+    INCR config:version
+    EXEC
+```
+
+---
+
+**3. Consistent Multi-Key Updates**
+
+```bash
+MULTI
+DECRBY inventory:item123 1
+INCRBY cart:user456 1
+EXEC
+```
+
+---
+
+### Summary
+
+**What Transactions Provide:**
+1. ✅ **Atomicity**: All commands execute together
+2. ✅ **Isolation**: No interleaving from other clients
+3. ✅ **Consistency**: Single-threaded guarantees order
+4. ❌ **Durability**: In-memory, not durable (use AOF/RDB)
+
+**Implementation Highlights:**
+1. ✅ Per-client state (`IsTransaction`, `CommandQueue`)
+2. ✅ Command queuing during MULTI
+3. ✅ Array response encoding for EXEC
+4. ✅ WATCH for optimistic locking
+5. ✅ Syntax error detection before EXEC
+
+**Key Differences from Traditional Databases:**
+- **No BEGIN/COMMIT**: Use MULTI/EXEC
+- **No ROLLBACK**: Failed commands don't revert
+- **No 2PC**: Simple command queuing
+- **No ACID guarantees**: Single-node, in-memory
+
+**Redis Transaction Philosophy:**
+- **Simplicity** over complexity
+- **Performance** over features
+- **Pragmatism** over theory
+
+**Next:** Internal data structures (ziplist, quicklist, intset)
+
+---
