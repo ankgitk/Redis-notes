@@ -6,6 +6,8 @@
 
 ## Table of Contents
 
+### Parts 1-7: Redis Internals and Implementation (How Redis is Built)
+
 1. [Introduction and Overview](#introduction-and-overview)
 2. [Building Redis from Scratch](#building-redis-from-scratch)
 3. [Core Commands Implementation](#core-commands-implementation)
@@ -13,6 +15,22 @@
 5. [Advanced Features](#advanced-features)
 6. [Internal Data Structures](#internal-data-structures)
 7. [Advanced Algorithms](#advanced-algorithms)
+
+### Part 8: User Guide and Practical Patterns (How to Use Redis)
+
+8. [Redis Data Structures: User Guide and Practical Patterns](#part-8-redis-data-structures---user-guide-and-practical-patterns)
+   - [Chapter 28: Strings - Commands, Use Cases, Examples](#chapter-28-strings---the-foundation-of-redis-data-storage)
+   - [Chapter 29: Lists - Commands, Use Cases, Examples](#chapter-29-lists---ordered-collections-for-queues-and-stacks)
+   - [Chapter 30: Sets - Commands, Use Cases, Examples](#chapter-30-sets---unique-collections-for-membership-and-relationships)
+   - [Chapter 31: Sorted Sets - Commands, Use Cases, Examples](#chapter-31-sorted-sets---ranked-collections-with-scores)
+   - [Chapter 32: Hashes - Commands, Use Cases, Examples](#chapter-32-hashes---field-value-pairs-within-keys)
+   - [Chapter 33: Bitmaps - Commands, Use Cases, Examples](#chapter-33-bitmaps---efficient-binary-operations)
+   - [Chapter 34: HyperLogLogs - Commands, Use Cases, Examples](#chapter-34-hyperloglogs---cardinality-estimation-at-scale)
+   - [Chapter 35: Streams - Commands, Use Cases, Examples](#chapter-35-streams---event-logs-and-message-queues)
+   - [Chapter 36: Pub/Sub - Messaging Patterns](#chapter-36-pubsub---messaging-patterns)
+   - [Chapter 37: Lua Scripting - Programmability](#chapter-37-lua-scripting-and-programmability)
+   - [Chapter 38: Geospatial - Location-Based Queries](#chapter-38-geospatial-commands---location-based-queries)
+   - [Chapter 39: Performance and Best Practices](#chapter-39-performance-considerations-and-best-practices)
 
 ---
 
@@ -11395,5 +11413,2967 @@ Evict: newkey (lowest frequency)
 ---
 
 **END OF COMPREHENSIVE REDIS INTERNALS GUIDE**
+
+---
+
+# Part 8: Redis Data Structures - User Guide and Practical Patterns
+
+> **Purpose of Part 8:** While Parts 1-7 covered how Redis is *built* (internals, algorithms, implementation details), Part 8 focuses on how to *use* Redis effectively. This section provides a comprehensive command reference, real-world use cases, and practical patterns for interview preparation and production development.
+
+> **Cross-Reference Note:** This part frequently references internals covered earlier:
+> - **Strings** → See Chapter 25 (SDS internals)
+> - **Lists** → See Chapter 22 (Ziplist/Quicklist internals)
+> - **Sets** → See Chapter 23 (Intset internals)
+> - **Sorted Sets** → See Chapter 24 (Geohash for geospatial), Chapter 22 (Ziplist encoding)
+> - **HyperLogLog** → See Chapter 26 (Cardinality estimation algorithm)
+> - **Bitmaps** → Built on Strings (Chapter 25)
+
+---
+
+## Chapter 28: Strings - The Foundation of Redis Data Storage
+
+**What are Redis Strings?**
+
+Redis Strings are the most basic data type, representing sequences of bytes that can store text, numbers, or binary data up to 512 MB. Despite being called "strings," they can efficiently handle integers and floating-point numbers with dedicated arithmetic operations.
+
+> **Internals Reference:** See Chapter 25 for Simple Dynamic Strings (SDS) implementation details, including O(1) length operations and smart pre-allocation strategies.
+
+**When to use Strings:**
+- Caching application data and web page fragments
+- Storing user session information
+- Implementing counters and metrics
+- Feature flags and configuration values
+- Distributed locking mechanisms
+
+### Real-world use cases
+
+#### 1. Web application caching
+```bash
+# Cache user profile data with expiration
+SET user:12345:profile '{"name":"John","email":"john@example.com"}' EX 3600
+GET user:12345:profile
+```
+
+#### 2. Website visitor counter
+```bash
+# Initialize daily visitor counter
+SET visitors:2024-06-19 0
+# Increment on each page view
+INCR visitors:2024-06-19
+# Returns: (integer) 1 after first visit
+```
+
+#### 3. Distributed rate limiting
+```bash
+# Allow maximum 100 requests per user per minute
+SET rate:user:12345:2024-06-19:10:30 1 NX EX 60
+INCR rate:user:12345:2024-06-19:10:30
+# Returns current request count, reject if > 100
+```
+
+### String commands deep dive
+
+#### SET - Store string value
+```bash
+SET key value [EX seconds] [PX milliseconds] [NX|XX] [KEEPTTL] [GET]
+```
+**Parameters:**
+- `key`: String key name
+- `value`: String value to store
+- `EX seconds`: Set expiration in seconds
+- `NX`: Only set if key doesn't exist
+- `XX`: Only set if key exists
+- `GET`: Return previous value
+
+**Examples:**
+```bash
+SET user:token "abc123"                    # Returns: OK
+SET user:token "def456" GET                # Returns: "abc123"
+SET session:temp "data" EX 300 NX          # Set with 5-minute expiration if not exists
+```
+
+#### GET - Retrieve string value
+```bash
+GET key
+```
+**Returns:** String value or (nil) if key doesn't exist
+
+```bash
+GET user:token                             # Returns: "def456"
+GET nonexistent                           # Returns: (nil)
+```
+
+#### INCR/DECR - Atomic increment operations
+```bash
+INCR key                                   # Increment by 1
+INCRBY key increment                       # Increment by specific amount
+DECR key                                   # Decrement by 1
+DECRBY key decrement                       # Decrement by specific amount
+INCRBYFLOAT key increment                  # Increment float value
+```
+
+**Examples:**
+```bash
+SET counter 10
+INCR counter                               # Returns: (integer) 11
+INCRBY counter 5                          # Returns: (integer) 16
+INCRBYFLOAT counter 2.5                   # Returns: "18.5"
+DECR counter                              # Returns: (integer) 17 (from 18.5 truncated)
+```
+
+#### Practical CLI Example: String and Counter Operations
+
+```redis
+127.0.0.1:6379> set name Shabbir
+OK
+127.0.0.1:6379> get name
+"Shabbir"
+127.0.0.1:6379> set email email@domain.com
+OK
+127.0.0.1:6379> get email
+"email@domain.com"
+127.0.0.1:6379> getrange email 0 4
+"email"
+127.0.0.1:6379> mset lang English technology Redis
+OK
+127.0.0.1:6379> mget lang technology
+1) "English"
+2) "Redis"
+127.0.0.1:6379> strlen lang
+(integer) 7
+127.0.0.1:6379> strlen technology
+(integer) 5
+127.0.0.1:6379> set count 1
+OK
+127.0.0.1:6379> get count
+"1"
+127.0.0.1:6379> incr count
+(integer) 2
+127.0.0.1:6379> incrby count 10
+(integer) 12
+127.0.0.1:6379> decr count
+(integer) 11
+127.0.0.1:6379> decrby count 5
+(integer) 6
+```
+
+#### APPEND - Concatenate strings
+```bash
+APPEND key value
+```
+**Returns:** Length of string after append
+
+```bash
+SET greeting "Hello"
+APPEND greeting " World"                   # Returns: (integer) 11
+GET greeting                              # Returns: "Hello World"
+```
+
+#### GETRANGE - Get substring
+```bash
+GETRANGE key start end
+```
+
+```bash
+SET mykey "Hello World"
+GETRANGE mykey 0 4                        # Returns: "Hello"
+GETRANGE mykey -5 -1                      # Returns: "World"
+```
+
+#### MSET/MGET - Multiple key operations
+```bash
+MSET key value [key value ...]
+MGET key [key ...]
+```
+
+```bash
+MSET key1 "value1" key2 "value2" key3 "value3"
+MGET key1 key2 key3                       # Returns: ["value1", "value2", "value3"]
+```
+
+#### STRLEN - Get string length
+```bash
+STRLEN key
+```
+
+```bash
+SET mykey "Hello"
+STRLEN mykey                              # Returns: (integer) 5
+```
+
+#### EXPIRE/TTL - Set and check expiration
+```bash
+EXPIRE key seconds                         # Set expiration time
+TTL key                                   # Get remaining time to live
+SETEX key seconds value                   # Set with expiration atomically
+```
+
+**Practical CLI Example: Expiration and Float Operations**
+
+```redis
+127.0.0.1:6379> set pi 3.14
+OK
+127.0.0.1:6379> get pi
+"3.14"
+127.0.0.1:6379> incrbyfloat pi 0.0001
+"3.1400999999999998"
+127.0.0.1:6379> set a 1
+OK
+127.0.0.1:6379> get a
+"1"
+127.0.0.1:6379> expire a 10
+(integer) 1
+127.0.0.1:6379> ttl a
+(integer) 4
+127.0.0.1:6379> ttl a
+(integer) 2
+127.0.0.1:6379> ttl a
+(integer) -2
+127.0.0.1:6379> get a
+(nil)
+127.0.0.1:6379> setex b 10 anyvalue
+OK
+127.0.0.1:6379> get b
+"anyvalue"
+127.0.0.1:6379> ttl b
+(integer) 2
+127.0.0.1:6379> ttl b
+(integer) -2
+127.0.0.1:6379> get b
+(nil)
+```
+
+---
+
+## Chapter 29: Lists - Ordered Collections for Queues and Stacks
+
+**What are Redis Lists?**
+
+Redis Lists are ordered collections of strings sorted by insertion order. Implemented as doubly-linked lists (or quicklists combining linked lists and ziplists), they provide fast insertion and deletion at both ends, making them perfect for queues, stacks, and activity feeds.
+
+> **Internals Reference:** See Chapter 22 for Ziplist and Quicklist implementation details, including memory-efficient encoding strategies.
+
+**When to use Lists:**
+- Message queues and task processing
+- Activity feeds and timelines
+- Stack-based operations (LIFO)
+- Queue-based operations (FIFO)
+- Chat message storage
+
+### Real-world use cases
+
+#### 1. Job queue system
+```bash
+# Producer adds jobs to queue
+LPUSH jobs:email "send_welcome_email:user123"
+LPUSH jobs:email "send_newsletter:batch42"
+
+# Worker processes jobs
+RPOP jobs:email                           # Returns: "send_welcome_email:user123"
+```
+
+#### 2. Activity feed timeline
+```bash
+# Add new activities to user's timeline
+LPUSH timeline:user123 "liked_post:456"
+LPUSH timeline:user123 "followed:user789"
+
+# Get recent activities (newest first)
+LRANGE timeline:user123 0 9              # Returns last 10 activities
+```
+
+#### 3. Chat message history
+```bash
+# Store chat messages
+RPUSH chat:room101 "user1: Hello everyone!"
+RPUSH chat:room101 "user2: Hi there!"
+
+# Get message history
+LRANGE chat:room101 -10 -1               # Returns last 10 messages
+```
+
+### List commands deep dive
+
+#### LPUSH/RPUSH - Add elements to list
+```bash
+LPUSH key element [element ...]           # Add to head (left)
+RPUSH key element [element ...]           # Add to tail (right)
+```
+**Returns:** Length of list after operation
+
+```bash
+RPUSH queue:tasks "task1" "task2" "task3" # Returns: (integer) 3
+LPUSH queue:tasks "urgent_task"           # Returns: (integer) 4
+# List order: ["urgent_task", "task1", "task2", "task3"]
+```
+
+#### LPOP/RPOP - Remove elements from list
+```bash
+LPOP key [count]                          # Remove from head
+RPOP key [count]                          # Remove from tail
+```
+**Returns:** Removed element(s) or (nil) if empty
+
+```bash
+RPOP queue:tasks                          # Returns: "task3"
+LPOP queue:tasks 2                        # Returns: ["urgent_task", "task1"]
+```
+
+#### Practical CLI Example: Basic List Operations
+
+```redis
+127.0.0.1:6379> lpush country India
+(integer) 1
+127.0.0.1:6379> lpush country USA
+(integer) 2
+127.0.0.1:6379> lrange country 0 -1
+1) "USA"
+2) "India"
+127.0.0.1:6379> lpush country UK
+(integer) 3
+127.0.0.1:6379> lrange country 0 -1
+1) "UK"
+2) "USA"
+3) "India"
+127.0.0.1:6379> lrange country 0 1
+1) "UK"
+2) "USA"
+127.0.0.1:6379> rpush country Australia
+(integer) 4
+127.0.0.1:6379> lrange country 0 -1
+1) "UK"
+2) "USA"
+3) "India"
+4) "Australia"
+127.0.0.1:6379> llen country
+(integer) 4
+127.0.0.1:6379> lpop country
+"UK"
+127.0.0.1:6379> rpop country
+"Australia"
+127.0.0.1:6379> lrange country 0 -1
+1) "USA"
+2) "India"
+127.0.0.1:6379> lpush country France
+(integer) 3
+```
+
+#### LRANGE - Get range of elements
+```bash
+LRANGE key start stop
+```
+**Parameters:**
+- `start`: Starting index (0-based, negative indices count from end)
+- `stop`: Ending index (inclusive)
+
+```bash
+RPUSH mylist "a" "b" "c" "d" "e"
+LRANGE mylist 0 2                         # Returns: ["a", "b", "c"]
+LRANGE mylist -2 -1                       # Returns: ["d", "e"]
+LRANGE mylist 0 -1                        # Returns: all elements
+```
+
+#### LINDEX - Get element by index
+```bash
+LINDEX key index
+```
+
+```bash
+LINDEX mylist 0                           # Returns: "a" (first element)
+LINDEX mylist -1                          # Returns: "e" (last element)
+```
+
+#### LLEN - Get list length
+```bash
+LLEN key
+```
+
+```bash
+LLEN mylist                               # Returns: (integer) 5
+LLEN nonexistent                          # Returns: (integer) 0
+```
+
+#### LSET - Set element at index
+```bash
+LSET key index value
+```
+
+```bash
+LSET mylist 0 "NEW"
+LRANGE mylist 0 -1                        # First element is now "NEW"
+```
+
+#### LINSERT - Insert before/after element
+```bash
+LINSERT key BEFORE|AFTER pivot value
+```
+
+```bash
+LINSERT mylist BEFORE "b" "inserted"
+LINSERT mylist AFTER "c" "another"
+```
+
+#### Practical CLI Example: Advanced List Operations
+
+```redis
+127.0.0.1:6379> lrange country 0 -1
+1) "France"
+2) "USA"
+3) "India"
+127.0.0.1:6379> lset country 0 Germany
+OK
+127.0.0.1:6379> lrange country 0 -1
+1) "Germany"
+2) "USA"
+3) "India"
+127.0.0.1:6379> linsert country before Germany "New Zealand"
+(integer) 4
+127.0.0.1:6379> lrange country 0 -1
+1) "New Zealand"
+2) "Germany"
+3) "USA"
+4) "India"
+127.0.0.1:6379> linsert country after USA UAE
+(integer) 5
+127.0.0.1:6379> lrange country 0 -1
+1) "New Zealand"
+2) "Germany"
+3) "USA"
+4) "UAE"
+5) "India"
+127.0.0.1:6379> lindex country 3
+"UAE"
+127.0.0.1:6379> lindex country 2
+"USA"
+```
+
+#### LPUSHX/RPUSHX - Push only if list exists
+```bash
+LPUSHX key element                        # Push to head only if key exists
+RPUSHX key element                        # Push to tail only if key exists
+```
+
+```bash
+LPUSHX newlist "value"                    # Returns: (integer) 0 (list doesn't exist)
+LPUSH newlist "first"                     # Create the list
+LPUSHX newlist "second"                   # Returns: (integer) 2 (now it works)
+```
+
+#### LTRIM - Trim list to range
+```bash
+LTRIM key start stop
+```
+
+```bash
+LPUSH mylist "a" "b" "c" "d" "e"
+LTRIM mylist 0 2                          # Keep only first 3 elements
+LRANGE mylist 0 -1                        # Returns: ["e", "d", "c"]
+```
+
+#### BLPOP/BRPOP - Blocking pop operations
+```bash
+BLPOP key [key ...] timeout               # Blocking left pop
+BRPOP key [key ...] timeout               # Blocking right pop
+```
+
+**Use case: Worker waiting for jobs**
+
+```bash
+# Worker blocks until job arrives (timeout 30 seconds)
+BRPOP jobs:queue 30
+# Returns: ["jobs:queue", "job_data"] when job is pushed
+```
+
+#### Practical CLI Example: Blocking Operations and Sorting
+
+```redis
+127.0.0.1:6379> blpop movies 1
+(nil)
+(1.07s)
+127.0.0.1:6379> blpop movies 15
+(nil)
+(15.10s)
+127.0.0.1:6379> blpop movies 15
+1) "movies"
+2) "abv"
+(12.67s)
+
+127.0.0.1:6379> lrange country 0 -1
+1) "South Africa"
+2) "New Zealand"
+3) "Germany"
+4) "USA"
+5) "UAE"
+6) "India"
+127.0.0.1:6379> sort country ALPHA
+1) "Germany"
+2) "India"
+3) "New Zealand"
+4) "South Africa"
+5) "UAE"
+6) "USA"
+127.0.0.1:6379> sort country desc ALPHA
+1) "USA"
+2) "UAE"
+3) "South Africa"
+4) "New Zealand"
+5) "India"
+6) "Germany"
+```
+
+---
+
+## Chapter 30: Sets - Unique Collections for Membership and Relationships
+
+**What are Redis Sets?**
+
+Redis Sets are unordered collections of unique strings that support fast membership testing, intersection, union, and difference operations. They're perfect for representing relationships and implementing tag systems.
+
+> **Internals Reference:** See Chapter 23 for Intset implementation details, including binary search and upgrade mechanisms for different integer sizes.
+
+**When to use Sets:**
+- User relationships (followers, friends)
+- Tag systems and categories
+- Unique visitor tracking
+- Recommendation systems
+- Access control lists
+
+### Real-world use cases
+
+#### 1. Social media followers
+```bash
+# User relationships
+SADD followers:user123 "user456" "user789" "user101"
+SADD following:user456 "user123" "user999"
+
+# Check if user456 follows user123
+SISMEMBER followers:user123 "user456"     # Returns: (integer) 1
+
+# Get mutual followers
+SINTER followers:user123 followers:user789
+```
+
+#### 2. Product tagging system
+```bash
+# Tag products
+SADD tags:electronics "laptop:1" "phone:2" "tablet:3"
+SADD tags:portable "phone:2" "tablet:3" "camera:4"
+
+# Find portable electronics
+SINTER tags:electronics tags:portable     # Returns: ["phone:2", "tablet:3"]
+```
+
+#### 3. Access control permissions
+```bash
+# Define user permissions
+SADD perms:admin "read" "write" "delete" "admin"
+SADD perms:editor "read" "write"
+
+# Check if admin can delete
+SISMEMBER perms:admin "delete"            # Returns: (integer) 1
+```
+
+### Set commands deep dive
+
+#### SADD - Add members to set
+```bash
+SADD key member [member ...]
+```
+**Returns:** Number of new members added
+
+```bash
+SADD tags:colors "red" "blue" "green"     # Returns: (integer) 3
+SADD tags:colors "red" "yellow"           # Returns: (integer) 1 (only yellow is new)
+```
+
+#### SREM - Remove members from set
+```bash
+SREM key member [member ...]
+```
+**Returns:** Number of members removed
+
+```bash
+SREM tags:colors "red" "purple"           # Returns: (integer) 1 (only red existed)
+```
+
+#### SMEMBERS - Get all set members
+```bash
+SMEMBERS key
+```
+**Returns:** Array of all members
+
+```bash
+SMEMBERS tags:colors                      # Returns: ["blue", "green", "yellow"]
+```
+
+#### SISMEMBER - Test membership
+```bash
+SISMEMBER key member
+```
+**Returns:** 1 if member exists, 0 otherwise
+
+```bash
+SISMEMBER tags:colors "blue"              # Returns: (integer) 1
+SISMEMBER tags:colors "red"               # Returns: (integer) 0
+```
+
+#### SCARD - Get set cardinality
+```bash
+SCARD key
+```
+
+```bash
+SCARD tags:colors                         # Returns: (integer) 3
+```
+
+#### Set operations: SINTER, SUNION, SDIFF
+```bash
+SINTER key [key ...]                      # Intersection
+SUNION key [key ...]                      # Union
+SDIFF key [key ...]                       # Difference
+```
+
+**Examples:**
+
+```bash
+SADD set1 "a" "b" "c"
+SADD set2 "b" "c" "d"
+
+SINTER set1 set2                          # Returns: ["b", "c"]
+SUNION set1 set2                          # Returns: ["a", "b", "c", "d"]
+SDIFF set1 set2                           # Returns: ["a"] (in set1 but not set2)
+```
+
+#### SDIFFSTORE, SINTERSTORE, SUNIONSTORE - Store operation results
+```bash
+SDIFFSTORE destination key [key ...]
+SINTERSTORE destination key [key ...]
+SUNIONSTORE destination key [key ...]
+```
+
+```bash
+SINTERSTORE result set1 set2
+SMEMBERS result                           # Returns intersection stored in 'result'
+```
+
+#### Practical CLI Example: Set Operations
+
+```redis
+127.0.0.1:6379> sadd technology Java
+(integer) 1
+127.0.0.1:6379> sadd technology Redis AWS
+(integer) 2
+127.0.0.1:6379> smembers technology
+1) "Redis"
+2) "AWS"
+3) "Java"
+127.0.0.1:6379> sadd technology Java
+(integer) 0
+127.0.0.1:6379> scard technology
+(integer) 3
+127.0.0.1:6379> sismember technology Java
+(integer) 1
+127.0.0.1:6379> sismember technology Spring
+(integer) 0
+127.0.0.1:6379> sadd frontend JavaScript HTML Nodejs React
+(integer) 4
+127.0.0.1:6379> smembers frontend
+1) "Nodejs"
+2) "JavaScript"
+3) "React"
+4) "HTML"
+127.0.0.1:6379> sdiff technology frontend
+1) "Redis"
+2) "Java"
+3) "AWS"
+127.0.0.1:6379> sdiffstore newset technology frontend
+(integer) 3
+127.0.0.1:6379> smembers newset
+1) "Redis"
+2) "Java"
+3) "AWS"
+127.0.0.1:6379> sinter technology frontend
+1) "Nodejs"
+```
+
+#### SPOP - Remove and return random member
+```bash
+SPOP key [count]
+```
+
+```bash
+SPOP tags:colors                          # Returns random member and removes it
+SPOP tags:colors 2                        # Returns 2 random members
+```
+
+#### SRANDMEMBER - Get random member without removing
+```bash
+SRANDMEMBER key [count]
+```
+
+```bash
+SRANDMEMBER tags:colors                   # Returns random member
+SRANDMEMBER tags:colors 2                 # Returns 2 random members (may repeat)
+```
+
+#### SMOVE - Move member between sets
+```bash
+SMOVE source destination member
+```
+
+```bash
+SMOVE set1 set2 "a"                       # Move "a" from set1 to set2
+```
+
+---
+
+## Chapter 31: Sorted Sets - Ranked Collections with Scores
+
+**What are Redis Sorted Sets (ZSets)?**
+
+Sorted Sets combine the uniqueness of Sets with automatic ordering by score. Each member has an associated floating-point score that determines its position in the set. They enable efficient range queries, ranking operations, and score-based filtering.
+
+> **Internals Reference:** See Chapter 24 for Geohash encoding (used in geospatial sorted sets) and Chapter 22 for Ziplist encoding optimization.
+
+**When to use Sorted Sets:**
+- Leaderboards and high scores
+- Priority queues with scores
+- Time-series data with timestamps
+- Geographic coordinates with distances
+- Weighted recommendation systems
+
+### Real-world use cases
+
+#### 1. Gaming leaderboard
+```bash
+# Add player scores
+ZADD leaderboard 1500 "player1" 2300 "player2" 1200 "player3"
+
+# Get top 5 players
+ZREVRANGE leaderboard 0 4 WITHSCORES      # Returns highest scores first
+
+# Get player rank
+ZREVRANK leaderboard "player1"            # Returns: (integer) 1 (2nd place)
+```
+
+#### 2. Priority task queue
+```bash
+# Add tasks with priority scores (higher = more urgent)
+ZADD tasks 1 "backup_database" 5 "fix_critical_bug" 3 "update_docs"
+
+# Process highest priority task
+ZPOPMAX tasks                             # Returns: ["fix_critical_bug", "5"]
+```
+
+#### 3. Time-series events
+```bash
+# Store events with timestamps as scores
+ZADD events 1692629576 "user_login" 1692629580 "page_view" 1692629590 "purchase"
+
+# Get events in time range
+ZRANGEBYSCORE events 1692629575 1692629585  # Returns events between timestamps
+```
+
+### Sorted Set commands deep dive
+
+#### ZADD - Add members with scores
+```bash
+ZADD key [options] score member [score member ...]
+```
+**Options:**
+- `XX`: Only update existing members
+- `NX`: Only add new members
+- `CH`: Return count of changed elements
+- `INCR`: Increment the score
+
+```bash
+ZADD scoreboard 100 "alice" 200 "bob"     # Returns: (integer) 2
+ZADD scoreboard XX 150 "alice"            # Update alice's score to 150
+ZADD scoreboard INCR 50 "bob"             # Increment bob's score by 50
+```
+
+#### Practical CLI Example: Sorted Set Operations (ZADD, ZCARD, ZREM)
+
+```redis
+127.0.0.1:6379> zadd users 1 Shabbir
+(integer) 1
+127.0.0.1:6379> zadd users 2 Alex 3 Nimah 4 Steve 5 Nich
+(integer) 4
+127.0.0.1:6379> zrange users 0 -1
+1) "Shabbir"
+2) "Alex"
+3) "Nimah"
+4) "Steve"
+5) "Nich"
+127.0.0.1:6379> zrange users 0 -1 withscores
+1) "Shabbir"
+2) "1"
+3) "Alex"
+4) "2"
+5) "Nimah"
+6) "3"
+7) "Steve"
+8) "4"
+9) "Nich"
+10) "5"
+127.0.0.1:6379> zcard users
+(integer) 5
+127.0.0.1:6379> zcount users -inf +inf
+(integer) 5
+127.0.0.1:6379> zcount users 0 4
+(integer) 4
+127.0.0.1:6379> zrem users Alex
+(integer) 1
+127.0.0.1:6379> zrange users 0 -1 withscores
+1) "Shabbir"
+2) "1"
+3) "Nimah"
+4) "3"
+5) "Steve"
+6) "4"
+7) "Nich"
+8) "5"
+```
+
+#### ZRANGE - Get members by rank
+```bash
+ZRANGE key start stop [WITHSCORES] [REV]
+```
+**Parameters:**
+- `start/stop`: Rank indices (0-based, negative from end)
+- `WITHSCORES`: Include scores in output
+- `REV`: Return in reverse order
+
+```bash
+ZRANGE scoreboard 0 -1                    # Returns: ["alice", "bob"]
+ZRANGE scoreboard 0 -1 WITHSCORES         # Returns: ["alice", "150", "bob", "250"]
+ZRANGE scoreboard 0 -1 REV                # Returns: ["bob", "alice"] (highest first)
+```
+
+#### ZREVRANGE - Get members in reverse order
+```bash
+ZREVRANGE key start stop [WITHSCORES]
+```
+
+```bash
+ZREVRANGE scoreboard 0 4 WITHSCORES       # Top 5 scores (highest to lowest)
+```
+
+#### ZRANGEBYSCORE / ZREVRANGEBYSCORE - Get members by score range
+```bash
+ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+```
+
+**Special score values:**
+- `-inf`: Negative infinity
+- `+inf`: Positive infinity
+- `(value`: Exclusive (open interval)
+
+```bash
+ZRANGEBYSCORE scoreboard 100 200          # Members with scores 100-200
+ZRANGEBYSCORE scoreboard "(100" "+inf"    # Members with scores > 100
+ZRANGEBYSCORE scoreboard -inf 200 LIMIT 0 5  # First 5 members with score ≤ 200
+```
+
+#### Practical CLI Example: ZINCRBY and ZREVRANGE
+
+```redis
+127.0.0.1:6379> zrange users 0 -1 withscores
+1) "Shabbir"
+2) "1"
+3) "Nimah"
+4) "3"
+5) "Steve"
+6) "4"
+7) "Nich"
+8) "5"
+127.0.0.1:6379> zrevrangebyscore users 5 0 withscores
+1) "Nich"
+2) "5"
+3) "Steve"
+4) "4"
+5) "Nimah"
+6) "3"
+7) "Shabbir"
+8) "1"
+127.0.0.1:6379> zincrby users 2 Steve
+"6"
+127.0.0.1:6379> zrevrangebyscore users 6 0 withscores
+1) "Steve"
+2) "6"
+3) "Nich"
+4) "5"
+5) "Nimah"
+6) "3"
+7) "Shabbir"
+8) "1"
+```
+
+#### ZRANK/ZREVRANK - Get member rank
+```bash
+ZRANK key member                          # Rank (0-based, lowest score = 0)
+ZREVRANK key member                       # Reverse rank (highest score = 0)
+```
+
+```bash
+ZRANK scoreboard "alice"                  # Returns: (integer) 0
+ZREVRANK scoreboard "alice"               # Returns: (integer) 1
+```
+
+#### ZSCORE - Get member score
+```bash
+ZSCORE key member
+```
+
+```bash
+ZSCORE scoreboard "alice"                 # Returns: "150"
+```
+
+#### ZCARD - Get number of members
+```bash
+ZCARD key
+```
+
+```bash
+ZCARD scoreboard                          # Returns: (integer) 2
+```
+
+#### ZCOUNT - Count members in score range
+```bash
+ZCOUNT key min max
+```
+
+```bash
+ZCOUNT scoreboard 100 200                 # Returns: (integer) 2
+ZCOUNT scoreboard -inf +inf               # Count all members
+```
+
+#### ZINCRBY - Increment member score
+```bash
+ZINCRBY key increment member
+```
+
+```bash
+ZINCRBY scoreboard 10 "alice"             # Returns: "160"
+```
+
+#### ZREM - Remove members
+```bash
+ZREM key member [member ...]
+```
+
+```bash
+ZREM scoreboard "alice" "bob"             # Returns: (integer) 2
+```
+
+#### ZREMRANGEBYRANK - Remove members by rank range
+```bash
+ZREMRANGEBYRANK key start stop
+```
+
+```bash
+ZREMRANGEBYRANK scoreboard 0 4            # Remove bottom 5 members
+```
+
+#### ZREMRANGEBYSCORE - Remove members by score range
+```bash
+ZREMRANGEBYSCORE key min max
+```
+
+```bash
+ZREMRANGEBYSCORE scoreboard 0 100         # Remove members with score 0-100
+```
+
+#### ZPOPMIN/ZPOPMAX - Remove and return members with lowest/highest scores
+```bash
+ZPOPMIN key [count]
+ZPOPMAX key [count]
+```
+
+```bash
+ZPOPMAX leaderboard                       # Remove and return highest scorer
+ZPOPMIN priority_queue 5                  # Process 5 lowest priority items
+```
+
+---
+
+## Chapter 32: Hashes - Field-Value Pairs Within Keys
+
+**What are Redis Hashes?**
+
+Redis Hashes are record types structured as collections of field-value pairs, similar to dictionaries or objects. They represent mappings between string field names and string values, making them ideal for representing objects and structured data.
+
+**When to use Hashes:**
+- User profiles and session data
+- Product information and inventory
+- Configuration settings
+- Real-time analytics and counters
+- Any object-like data structure
+
+### Real-world use cases
+
+#### 1. User profile management
+```bash
+# Store user profile with multiple attributes
+HSET user:12345 name "John Doe" email "john@example.com" age 30 location "New York" last_login "2024-06-19"
+
+# Quick profile retrieval
+HGETALL user:12345
+```
+
+#### 2. E-commerce product catalog
+```bash
+# Product inventory with dynamic pricing
+HSET product:bike:1 model "Deimos" brand "Ergonom" type "Enduro bikes" price 4972 stock 15
+
+# Update price without affecting other fields
+HINCRBY product:bike:1 price 100          # Increase price by $100
+HINCRBY product:bike:1 stock -1           # Decrease stock by 1
+```
+
+#### 3. Real-time analytics dashboard
+```bash
+# Track website metrics
+HINCRBY analytics:daily:2024-06-19 page_views 1
+HINCRBY analytics:daily:2024-06-19 unique_visitors 1
+HINCRBY analytics:daily:2024-06-19 sales_revenue 299
+
+# Get all metrics at once
+HGETALL analytics:daily:2024-06-19
+```
+
+### Hash commands deep dive
+
+#### HSET - Set field values
+```bash
+HSET key field value [field value ...]
+```
+**Returns:** Number of new fields created
+
+```bash
+HSET user:100 name "Alice" age 25 city "SF"  # Returns: (integer) 3
+HSET user:100 age 26                      # Returns: (integer) 0 (field updated)
+```
+
+#### HGET/HMGET - Get field values
+```bash
+HGET key field                            # Get single field
+HMGET key field [field ...]               # Get multiple fields
+```
+
+```bash
+HGET user:100 name                        # Returns: "Alice"
+HMGET user:100 name age city              # Returns: ["Alice", "26", "SF"]
+```
+
+#### HGETALL - Get all fields and values
+```bash
+HGETALL key
+```
+
+```bash
+HGETALL user:100
+# Returns: ["name", "Alice", "age", "26", "city", "SF"]
+```
+
+#### HDEL - Delete fields
+```bash
+HDEL key field [field ...]
+```
+**Returns:** Number of fields deleted
+
+```bash
+HDEL user:100 age city                    # Returns: (integer) 2
+```
+
+#### HEXISTS - Check if field exists
+```bash
+HEXISTS key field
+```
+
+```bash
+HEXISTS user:100 name                     # Returns: (integer) 1
+HEXISTS user:100 deleted_field            # Returns: (integer) 0
+```
+
+#### HINCRBY / HINCRBYFLOAT - Increment field value
+```bash
+HINCRBY key field increment
+HINCRBYFLOAT key field increment
+```
+
+```bash
+HINCRBY user:100 login_count 1            # Returns: (integer) 1
+HINCRBY user:100 points -50               # Decrement by 50
+HINCRBYFLOAT product:1 price 10.99        # Returns: "210.99"
+```
+
+#### HKEYS / HVALS - Get all keys or values
+```bash
+HKEYS key                                 # Get all field names
+HVALS key                                 # Get all values
+```
+
+```bash
+HKEYS user:100                            # Returns: ["name", "city", "login_count"]
+HVALS user:100                            # Returns: ["Alice", "SF", "1"]
+```
+
+#### HLEN - Get number of fields
+```bash
+HLEN key
+```
+
+```bash
+HLEN user:100                             # Returns: (integer) 3
+```
+
+#### HSETNX - Set field only if it doesn't exist
+```bash
+HSETNX key field value
+```
+
+```bash
+HSETNX user:100 name "Bob"                # Returns: (integer) 0 (field exists)
+HSETNX user:100 phone "555-1234"          # Returns: (integer) 1 (new field)
+```
+
+#### HSTRLEN - Get length of field value
+```bash
+HSTRLEN key field
+```
+
+```bash
+HSTRLEN user:100 name                     # Returns: (integer) 5 ("Alice")
+```
+
+---
+
+## Chapter 33: Bitmaps - Efficient Binary Operations
+
+**What are Redis Bitmaps?**
+
+Redis Bitmaps are not a separate data type but bit-oriented operations on Strings. They treat strings as bit vectors, allowing efficient manipulation of individual bits. Perfect for representing boolean information across large domains with minimal memory usage.
+
+> **Internals Reference:** Bitmaps are built on Simple Dynamic Strings (SDS) - see Chapter 25 for the underlying string implementation.
+
+**When to use Bitmaps:**
+- User activity tracking (daily/monthly active users)
+- Feature flags and A/B testing
+- Real-time analytics
+- Event occurrence tracking
+- Presence/absence monitoring
+
+### Real-world use cases
+
+#### 1. Daily active user tracking
+```bash
+# Mark user 1000 as active on June 19, 2024
+SETBIT users:active:2024-06-19 1000 1
+
+# Check if user 1000 was active
+GETBIT users:active:2024-06-19 1000       # Returns: (integer) 1
+
+# Count total active users for the day
+BITCOUNT users:active:2024-06-19          # Returns: (integer) 15347
+```
+
+#### 2. Feature flag management
+```bash
+# Enable feature for specific users
+SETBIT features:beta_ui 1000 1            # Enable for user 1000
+SETBIT features:beta_ui 2500 1            # Enable for user 2500
+
+# Check if user has feature enabled
+GETBIT features:beta_ui 1000              # Returns: (integer) 1
+```
+
+#### 3. A/B testing analytics
+```bash
+# Track user actions across different events
+SETBIT events:login:2024-06-19 1000 1
+SETBIT events:purchase:2024-06-19 1000 1
+
+# Find users who logged in AND made a purchase
+BITOP AND result events:login:2024-06-19 events:purchase:2024-06-19
+BITCOUNT result                           # Count users who did both
+```
+
+### Bitmap commands deep dive
+
+#### SETBIT/GETBIT - Set and get bit values
+```bash
+SETBIT key offset value                   # Set bit at offset to 0 or 1
+GETBIT key offset                         # Get bit value at offset
+```
+
+```bash
+SETBIT user:flags 0 1                     # Returns: (integer) 0 (previous value)
+GETBIT user:flags 0                       # Returns: (integer) 1
+GETBIT user:flags 999                     # Returns: (integer) 0 (unset bits default to 0)
+```
+
+#### BITCOUNT - Count set bits
+```bash
+BITCOUNT key [start end]
+```
+**Parameters:**
+- `start/end`: Byte range (not bit range)
+
+```bash
+BITCOUNT user:flags                       # Count all set bits
+BITCOUNT user:flags 0 10                  # Count set bits in bytes 0-10
+```
+
+#### BITPOS - Find first bit with specified value
+```bash
+BITPOS key bit [start [end]]
+```
+
+```bash
+BITPOS user:flags 1                       # Find first set bit position
+BITPOS user:flags 0                       # Find first unset bit position
+```
+
+#### BITOP - Bitwise operations
+```bash
+BITOP operation destkey key [key ...]
+```
+**Operations:** AND, OR, XOR, NOT
+
+```bash
+# Find users active on both days
+BITOP AND both_days active:2024-06-18 active:2024-06-19
+
+# Find users active on either day
+BITOP OR either_day active:2024-06-18 active:2024-06-19
+
+# Find users active on first day but not second
+BITOP AND temp active:2024-06-18 active:2024-06-18
+BITOP NOT temp2 active:2024-06-19
+BITOP AND first_not_second temp temp2
+```
+
+#### BITFIELD - Operate on multiple bit fields
+```bash
+BITFIELD key [GET type offset] [SET type offset value] [INCRBY type offset increment]
+```
+
+**Complex example:**
+
+```bash
+BITFIELD mykey SET u8 0 255 SET u8 8 128  # Set two 8-bit unsigned integers
+BITFIELD mykey GET u8 0 GET u8 8          # Returns: [255, 128]
+BITFIELD mykey INCRBY u8 0 1              # Increment first field
+```
+
+---
+
+## Chapter 34: HyperLogLogs - Cardinality Estimation at Scale
+
+**What are Redis HyperLogLogs?**
+
+HyperLogLog is a probabilistic data structure that estimates cardinality (number of unique elements) using constant memory (12 KB maximum), regardless of dataset size. It provides approximate counts with 0.81% standard error, making it perfect for large-scale analytics.
+
+> **Internals Reference:** See Chapter 26 for the Flajolet-Martin algorithm implementation, register-based estimation, and stochastic averaging details.
+
+**When to use HyperLogLogs:**
+- Unique visitor counting for web analytics
+- Unique item tracking in massive datasets
+- Cardinality estimation where memory efficiency is critical
+- Real-time analytics requiring fast operations
+
+### Real-world use cases
+
+#### 1. Web analytics - unique visitor tracking
+```bash
+# Track unique visitors per page per day
+PFADD visitors:homepage:2024-06-19 192.168.1.1 10.0.0.5 172.16.0.10
+PFCOUNT visitors:homepage:2024-06-19       # Returns: (integer) 3
+
+# Track over multiple days
+PFADD visitors:homepage:2024-06-20 192.168.1.1 10.0.0.6
+PFCOUNT visitors:homepage:2024-06-19 visitors:homepage:2024-06-20  # Union count
+```
+
+#### 2. Search analytics - unique query tracking
+```bash
+# Daily unique search queries
+PFADD search_queries:2024-06-19 "redis tutorial" "database optimization"
+PFCOUNT search_queries:2024-06-19         # Returns: (integer) 2
+```
+
+#### 3. IoT sensor data - unique device tracking
+```bash
+# Track unique IoT devices per location
+PFADD devices:building_A sensor_001 sensor_042 sensor_156
+PFADD devices:building_B sensor_042 sensor_200 sensor_305
+PFCOUNT devices:building_A devices:building_B  # Returns: (integer) 5 (union count)
+```
+
+### HyperLogLog commands deep dive
+
+#### PFADD - Add elements
+```bash
+PFADD key element [element ...]
+```
+**Returns:** 1 if cardinality estimate changed, 0 otherwise
+
+```bash
+PFADD unique_users user_001 user_002 user_003  # Returns: (integer) 1
+PFADD unique_users user_001                  # Returns: (integer) 0 (duplicate)
+```
+
+#### PFCOUNT - Count unique elements
+```bash
+PFCOUNT key [key ...]
+```
+**Returns:** Estimated cardinality
+
+```bash
+PFCOUNT unique_users                      # Returns: (integer) 3
+PFCOUNT users_today users_yesterday       # Returns union cardinality
+```
+
+#### PFMERGE - Merge HyperLogLogs
+```bash
+PFMERGE destkey sourcekey [sourcekey ...]
+```
+
+```bash
+# Merge daily counts into weekly total
+PFMERGE weekly_users daily:mon daily:tue daily:wed daily:thu daily:fri
+PFCOUNT weekly_users                      # Returns weekly unique count
+```
+
+**Memory efficiency example:**
+
+```bash
+# Track 1 billion unique users using only 12 KB
+# Traditional set would use ~8 GB (assuming 8 bytes per user ID)
+PFADD huge_dataset user_000000001 user_000000002 ... user_1000000000
+MEMORY USAGE huge_dataset                 # Returns: ~12288 bytes (12 KB)
+```
+
+---
+
+## Chapter 35: Streams - Event Logs and Message Queues
+
+**What are Redis Streams?**
+
+Redis Streams are persistent, append-only log data structures that act like sophisticated message queues. They provide reliable message delivery, consumer groups, and blocking operations for real-time data processing with guaranteed delivery semantics.
+
+**When to use Streams:**
+- Event sourcing architectures
+- Real-time data processing pipelines
+- Message queuing with guaranteed delivery
+- Log aggregation and analysis
+- IoT data collection and processing
+
+### Real-world use cases
+
+#### 1. Event sourcing - user activity tracking
+```bash
+# Record user events with automatic timestamp-based IDs
+XADD user_events:12345 * action "login" ip "192.168.1.100"
+XADD user_events:12345 * action "page_view" page "/dashboard" duration "2.3"
+XADD user_events:12345 * action "logout" session_duration "1847"
+
+# Read all events for user
+XRANGE user_events:12345 - +
+```
+
+#### 2. IoT sensor monitoring
+```bash
+# Temperature sensor data with location and readings
+XADD sensors:temperature * device_id "temp_001" location "building_A_floor_2" temperature "23.5" humidity "45.2"
+
+# Read last hour of data
+XREVRANGE sensors:temperature + - COUNT 100
+```
+
+#### 3. Real-time notifications
+```bash
+# Add notification to user's stream
+XADD notifications:user_789 * type "message" from "user_123" title "New Message" content "Hello there!"
+
+# User reads notifications
+XREAD COUNT 10 STREAMS notifications:user_789 0
+```
+
+### Stream commands deep dive
+
+#### XADD - Add entry to stream
+```bash
+XADD key [MAXLEN ~ count] * field value [field value ...]
+```
+**Parameters:**
+- `*`: Auto-generate unique ID (recommended)
+- `MAXLEN ~ count`: Approximate stream size limit
+- `field value`: One or more field-value pairs
+
+```bash
+XADD events * user_id "123" action "click" element "signup_button"
+# Returns: "1692629576966-0"
+
+# Add with stream size limit
+XADD sensor_data MAXLEN ~ 1000 * temperature "25.3" humidity "48.2"
+```
+
+#### XREAD - Read entries from stream
+```bash
+XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
+```
+
+```bash
+# Read from beginning
+XREAD COUNT 5 STREAMS events 0
+
+# Read only new entries (blocking)
+XREAD BLOCK 1000 STREAMS events $          # Block for 1 second
+
+# Read from specific ID onwards
+XREAD STREAMS events 1692629576966-0
+```
+
+#### XRANGE / XREVRANGE - Read range of entries
+```bash
+XRANGE key start end [COUNT count]
+XREVRANGE key end start [COUNT count]
+```
+
+```bash
+XRANGE events - +                         # Get all entries
+XRANGE events 1692629576966 1692629586966 # Get entries in time range
+XREVRANGE events + - COUNT 10             # Get last 10 entries (newest first)
+```
+
+#### XLEN - Get stream length
+```bash
+XLEN key
+```
+
+```bash
+XLEN events                               # Returns: (integer) 42
+```
+
+#### XDEL - Delete entries
+```bash
+XDEL key id [id ...]
+```
+
+```bash
+XDEL events 1692629576966-0 1692629576967-0  # Returns: (integer) 2
+```
+
+#### XTRIM - Trim stream to size
+```bash
+XTRIM key MAXLEN ~ count
+```
+
+```bash
+XTRIM events MAXLEN ~ 1000                # Keep approximately 1000 entries
+```
+
+#### Consumer Groups for Guaranteed Delivery
+
+Consumer groups enable multiple consumers to process messages reliably with at-least-once delivery guarantees.
+
+#### XGROUP CREATE - Create consumer group
+```bash
+XGROUP CREATE stream group start-id [MKSTREAM]
+```
+
+```bash
+# Create processing group starting from latest entries
+XGROUP CREATE user_events processors $
+
+# Create group from beginning
+XGROUP CREATE user_events batch_processors 0
+```
+
+#### XREADGROUP - Read as consumer group member
+```bash
+XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] STREAMS stream [stream ...] id [id ...]
+```
+
+```bash
+# Consumer reads new messages
+XREADGROUP GROUP processors worker1 COUNT 5 STREAMS user_events >
+
+# Block until messages arrive
+XREADGROUP GROUP processors worker1 BLOCK 5000 STREAMS user_events >
+```
+
+#### XACK - Acknowledge processed messages
+```bash
+XACK stream group id [id ...]
+```
+
+```bash
+# Process messages, then acknowledge
+XACK user_events processors 1692629576966-0 1692629576967-0
+```
+
+#### XPENDING - Check pending messages
+```bash
+XPENDING stream group [start end count [consumer]]
+```
+
+```bash
+# See pending messages for group
+XPENDING user_events processors
+
+# See specific consumer's pending messages
+XPENDING user_events processors - + 10 worker1
+```
+
+#### XCLAIM - Claim pending messages from another consumer
+```bash
+XCLAIM stream group consumer min-idle-time id [id ...]
+```
+
+```bash
+# Claim messages idle for > 60 seconds
+XCLAIM user_events processors worker2 60000 1692629576966-0
+```
+
+**Complete workflow example:**
+
+```bash
+# 1. Create stream and consumer group
+XGROUP CREATE orders order_processors $ MKSTREAM
+
+# 2. Add orders to stream
+XADD orders * order_id "12345" amount "99.99" customer "alice"
+XADD orders * order_id "12346" amount "149.50" customer "bob"
+
+# 3. Consumer 1 reads messages
+XREADGROUP GROUP order_processors worker1 COUNT 2 STREAMS orders >
+# Returns:
+# 1) "orders"
+# 2) 1) 1) "1692629576966-0"
+#       2) ["order_id", "12345", "amount", "99.99", "customer", "alice"]
+#    2) 1) "1692629576967-0"
+#       2) ["order_id", "12346", "amount", "149.50", "customer", "bob"]
+
+# 4. Process orders and acknowledge
+# ... processing logic ...
+XACK orders order_processors 1692629576966-0 1692629576967-0
+
+# 5. Check for failed messages (unacknowledged)
+XPENDING orders order_processors - + 10
+
+# 6. Claim failed messages (if worker1 crashed)
+XCLAIM orders order_processors worker2 300000 1692629576966-0
+```
+
+---
+
+## Chapter 36: Pub/Sub - Messaging Patterns
+
+**What is Redis Pub/Sub?**
+
+Redis Pub/Sub implements the publish/subscribe messaging paradigm where publishers send messages to channels, and subscribers receive messages from channels they're interested in. This is a fire-and-forget messaging pattern with no message persistence.
+
+**When to use Pub/Sub:**
+- Real-time notifications and alerts
+- Chat applications
+- Live updates and feeds
+- Event broadcasting to multiple listeners
+- Microservice event distribution
+
+**Important characteristics:**
+- **No persistence**: Messages not received are lost
+- **No acknowledgments**: Fire-and-forget delivery
+- **Pattern matching**: Subscribe to channel patterns with wildcards
+- **Multiple subscribers**: Each message delivered to all subscribers
+
+### Real-world use cases
+
+#### 1. Real-time chat system
+```bash
+# Users subscribe to chat room
+SUBSCRIBE chat:room:101
+
+# User sends message to room
+PUBLISH chat:room:101 "user123: Hello everyone!"
+```
+
+#### 2. Live notifications
+```bash
+# User subscribes to personal notifications
+SUBSCRIBE notifications:user:456
+
+# System sends notification
+PUBLISH notifications:user:456 '{"type":"message","from":"user789","text":"New message"}'
+```
+
+#### 3. Microservice event broadcasting
+```bash
+# Services subscribe to relevant events
+SUBSCRIBE events:order:created
+SUBSCRIBE events:order:*
+
+# Order service publishes event
+PUBLISH events:order:created '{"order_id":"12345","amount":99.99}'
+```
+
+### Pub/Sub commands deep dive
+
+#### SUBSCRIBE - Subscribe to channels
+```bash
+SUBSCRIBE channel [channel ...]
+```
+
+**Enters subscription mode** - only subscription commands available until unsubscribe.
+
+```bash
+SUBSCRIBE news updates alerts
+# Receives:
+# 1) "subscribe"
+# 2) "news"
+# 3) (integer) 1
+```
+
+#### PSUBSCRIBE - Subscribe with pattern matching
+```bash
+PSUBSCRIBE pattern [pattern ...]
+```
+
+**Pattern wildcards:**
+- `*`: Matches any characters
+- `?`: Matches single character
+- `[abc]`: Matches one of the characters
+- `[^a]`: Matches any character except 'a'
+
+```bash
+PSUBSCRIBE news:*                         # All news channels
+PSUBSCRIBE user:*:notifications           # All user notification channels
+PSUBSCRIBE events:order:*                 # All order events
+```
+
+#### PUBLISH - Publish message to channel
+```bash
+PUBLISH channel message
+```
+**Returns:** Number of subscribers that received the message
+
+```bash
+PUBLISH news "Breaking: Redis 7.0 released!"  # Returns: (integer) 3
+PUBLISH alerts "Server maintenance at 2 AM"   # Returns: (integer) 0 (no subscribers)
+```
+
+#### UNSUBSCRIBE - Unsubscribe from channels
+```bash
+UNSUBSCRIBE [channel [channel ...]]
+```
+
+```bash
+UNSUBSCRIBE news                          # Unsubscribe from specific channel
+UNSUBSCRIBE                               # Unsubscribe from all channels
+```
+
+#### PUNSUBSCRIBE - Unsubscribe from patterns
+```bash
+PUNSUBSCRIBE [pattern [pattern ...]]
+```
+
+```bash
+PUNSUBSCRIBE news:*                       # Unsubscribe from pattern
+PUNSUBSCRIBE                              # Unsubscribe from all patterns
+```
+
+#### PUBSUB CHANNELS - List active channels
+```bash
+PUBSUB CHANNELS [pattern]
+```
+
+```bash
+PUBSUB CHANNELS                           # List all active channels
+PUBSUB CHANNELS news:*                    # List matching channels
+```
+
+#### PUBSUB NUMSUB - Count subscribers per channel
+```bash
+PUBSUB NUMSUB [channel [channel ...]]
+```
+
+```bash
+PUBSUB NUMSUB news updates
+# Returns: ["news", "3", "updates", "5"]
+```
+
+#### PUBSUB NUMPAT - Count pattern subscriptions
+```bash
+PUBSUB NUMPAT
+```
+
+```bash
+PUBSUB NUMPAT                             # Returns: (integer) 7
+```
+
+### Practical CLI Example: Pub/Sub Operations
+
+```redis
+# Subscriber terminal (pattern subscription with wildcards)
+127.0.0.1:6379> psubscribe news hello broadcast
+Reading messages... (press ctrl-c to quit)
+1) "psubscribe"
+2) "news"
+3) (integer) 1
+1) "psubscribe"
+2) "hello"
+3) (integer) 2
+1) "psubscribe"
+2) "broadcast"
+3) (integer) 3
+
+# Receives messages when published:
+1) "pmessage"
+2) "news"
+3) "news"
+4) "New Ball"
+1) "message"
+2) "hello"
+3) "Hello"
+1) "message"
+2) "broadcast"
+3) "New Broadcast"
+
+# Publisher terminal
+127.0.0.1:6379> publish news "New Breaking News"
+(integer) 1
+127.0.0.1:6379> publish news "New News"
+(integer) 1
+127.0.0.1:6379> publish hello Hello
+(integer) 1
+127.0.0.1:6379> publish ball "New Ball"
+(integer) 1
+127.0.0.1:6379> publish bill "Bills"
+(integer) 1
+127.0.0.1:6379> publish broadcast "New Broadcast"
+(integer) 1
+
+# Introspection commands
+127.0.0.1:6379> pubsub channels
+1) "broadcast"
+2) "news"
+3) "hello"
+127.0.0.1:6379> pubsub numsub news
+1) "news"
+2) (integer) 3
+127.0.0.1:6379> pubsub numpat
+(integer) 1
+```
+
+### Pub/Sub vs Streams comparison
+
+| Feature | Pub/Sub | Streams |
+|---------|---------|---------|
+| **Persistence** | None (fire-and-forget) | Durable (stored on disk) |
+| **Message history** | No | Yes (can read past messages) |
+| **Delivery guarantees** | At-most-once | At-least-once (with consumer groups) |
+| **Acknowledgments** | No | Yes (XACK) |
+| **Consumer groups** | No | Yes |
+| **Pattern matching** | Yes (PSUBSCRIBE) | No |
+| **Use case** | Real-time broadcasts, live updates | Event sourcing, reliable queuing |
+| **Memory** | No overhead | Stores all messages until trimmed |
+
+**When to choose Pub/Sub:**
+- Real-time notifications where lost messages are acceptable
+- Broadcasting to multiple listeners simultaneously
+- Low latency more important than reliability
+- No need for message history
+
+**When to choose Streams:**
+- Need message persistence and history
+- Require delivery acknowledgments
+- Multiple consumers processing messages (consumer groups)
+- Event sourcing and audit trails
+
+---
+
+## Chapter 37: Lua Scripting and Programmability
+
+**What is Lua Scripting in Redis?**
+
+Redis supports executing Lua scripts on the server side, enabling atomic execution of complex operations that would otherwise require multiple round trips. Scripts have access to all Redis commands and execute atomically without interruption.
+
+**When to use Lua scripting:**
+- Atomic multi-step operations (compare-and-swap patterns)
+- Complex business logic requiring multiple Redis operations
+- Reducing network round trips
+- Implementing custom commands
+- Rate limiting and quota management
+
+**Key characteristics:**
+- **Atomicity**: Entire script executes as a single atomic operation
+- **No race conditions**: Scripts cannot be interrupted
+- **Server-side execution**: Reduces network latency
+- **Caching**: Scripts can be pre-loaded and executed by SHA hash
+
+### Real-world use cases
+
+#### 1. Atomic compare-and-swap
+```lua
+-- Only update if current value matches expected
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+    redis.call('SET', KEYS[1], ARGV[2])
+    return 1
+else
+    return 0
+end
+```
+
+```bash
+EVAL "local current = redis.call('GET', KEYS[1]); if current == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2]); return 1 else return 0 end" 1 mykey "expected" "new_value"
+```
+
+#### 2. Rate limiting with sliding window
+```lua
+-- Implement sliding window rate limiter
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+-- Remove old entries outside window
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+
+-- Count current requests
+local current = redis.call('ZCARD', key)
+
+if current < limit then
+    -- Add new request
+    redis.call('ZADD', key, now, now)
+    redis.call('EXPIRE', key, window)
+    return 1
+else
+    return 0
+end
+```
+
+#### 3. Conditional increment with max value
+```lua
+-- Increment only if value doesn't exceed max
+local current = tonumber(redis.call('GET', KEYS[1]) or 0)
+local max = tonumber(ARGV[1])
+local increment = tonumber(ARGV[2])
+
+if current + increment <= max then
+    return redis.call('INCRBY', KEYS[1], increment)
+else
+    return current
+end
+```
+
+### Lua scripting commands deep dive
+
+#### EVAL - Execute Lua script
+```bash
+EVAL script numkeys key [key ...] arg [arg ...]
+```
+
+**Parameters:**
+- `script`: Lua script code
+- `numkeys`: Number of keys (separates KEYS from ARGV)
+- `key`: Keys accessed by script (available as KEYS table)
+- `arg`: Arguments to script (available as ARGV table)
+
+**Simple example:**
+
+```bash
+EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 mykey "Hello"
+# Returns: OK
+```
+
+**Multiple operations:**
+
+```bash
+EVAL "redis.call('SET', KEYS[1], ARGV[1]); redis.call('INCR', KEYS[2]); return redis.call('GET', KEYS[2])" 2 name counter "Alice"
+# Sets name="Alice", increments counter, returns counter value
+```
+
+#### Practical CLI Example: Lua Scripting with EVAL
+
+```redis
+127.0.0.1:6379> eval "redis.call('set', KEYS[1], ARGV[1])" 1 name Shabbir
+(nil)
+127.0.0.1:6379> get name
+"Shabbir"
+
+127.0.0.1:6379> eval "redis.call('mset', KEYS[1], ARGV[1], KEYS[2], ARGV[2])" 2 name last_name Shabbir Dawoodi
+(nil)
+127.0.0.1:6379> get last_name
+"Dawoodi"
+```
+
+#### Advanced Example: Combining Multiple Data Structures
+
+```redis
+# Create data
+127.0.0.1:6379> hmset country_cap India "New Delhi" USA "Washington, D.C." Russia Moscow Germany Berlin Japan Tokyo Italy Rome
+OK
+127.0.0.1:6379> zadd country 1 Italy 2 India 3 USA
+(integer) 3
+127.0.0.1:6379> zrange country 0 -1
+1) "Italy"
+2) "India"
+3) "USA"
+
+# Use Lua to get sorted set order and lookup hash values
+127.0.0.1:6379> eval "local order = redis.call('zrange', KEYS[1], 0, -1); return redis.call('hmget', KEYS[2], unpack(order));" 2 country country_cap
+1) "Rome"
+2) "New Delhi"
+3) "Washington, D.C."
+```
+
+**Explanation:** This script atomically:
+1. Gets ordered country names from sorted set
+2. Uses those names to lookup capitals from hash
+3. Returns capitals in sorted set order
+
+#### EVALSHA - Execute cached script by SHA hash
+```bash
+EVALSHA sha1 numkeys key [key ...] arg [arg ...]
+```
+
+**Benefits:**
+- Reduces bandwidth (send hash instead of full script)
+- Faster execution (script already parsed)
+- Script reuse across multiple calls
+
+**Workflow:**
+
+```bash
+# 1. Load script and get SHA hash
+SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+# Returns: "a42059b356c875f0717db19a51f6aaca9ae659ea"
+
+# 2. Execute by SHA (much more efficient)
+EVALSHA a42059b356c875f0717db19a51f6aaca9ae659ea 1 mykey
+# Returns: value of mykey
+```
+
+#### Practical CLI Example: Script Caching
+
+```redis
+127.0.0.1:6379> script load "local order = redis.call('zrange', KEYS[1], 0, -1); return redis.call('hmget', KEYS[2], unpack(order));"
+"030395796a98abf5fa2af083ba1680aae53efd6"
+
+127.0.0.1:6379> evalsha 030395796a98abf5fa2af083ba1680aae53efd6 2 country country_cap
+1) "Rome"
+2) "New Delhi"
+3) "Washington, D.C."
+
+127.0.0.1:6379> script exists 030395796a98abf5fa2af083ba1680aae53efd6
+1) (integer) 1
+
+127.0.0.1:6379> script flush
+OK
+
+127.0.0.1:6379> script exists 030395796a98abf5fa2af083ba1680aae53efd6
+1) (integer) 0
+```
+
+#### SCRIPT LOAD - Pre-load script without executing
+```bash
+SCRIPT LOAD script
+```
+
+```bash
+SCRIPT LOAD "return redis.call('INCR', KEYS[1])"
+# Returns SHA: "e0e1f9fabfc9d4800c877a703b823ac0578ff8db"
+```
+
+#### SCRIPT EXISTS - Check if scripts are cached
+```bash
+SCRIPT EXISTS sha1 [sha1 ...]
+```
+
+```bash
+SCRIPT EXISTS e0e1f9fabfc9d4800c877a703b823ac0578ff8db a42059b356c875f0717db19a51f6aaca9ae659ea
+# Returns: [(integer) 1, (integer) 0]
+```
+
+#### SCRIPT FLUSH - Remove all cached scripts
+```bash
+SCRIPT FLUSH [ASYNC|SYNC]
+```
+
+```bash
+SCRIPT FLUSH                              # Clear all cached scripts
+```
+
+#### SCRIPT KILL - Kill currently running script
+```bash
+SCRIPT KILL
+```
+
+**Use case:** Kill a long-running script that hasn't modified data
+
+```bash
+SCRIPT KILL
+# Returns: OK (if script hasn't written data)
+# Returns: Error (if script has written data - must use SHUTDOWN NOSAVE)
+```
+
+### Lua scripting best practices
+
+#### 1. Always use KEYS and ARGV properly
+
+```lua
+-- CORRECT: Keys in KEYS, values in ARGV
+EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 mykey myvalue
+
+-- WRONG: Hardcoded keys prevent cluster compatibility
+EVAL "return redis.call('SET', 'mykey', ARGV[1])" 0 myvalue
+```
+
+#### 2. Return meaningful values
+
+```lua
+-- Return operation result
+local result = redis.call('INCR', KEYS[1])
+if result > 100 then
+    redis.call('SET', KEYS[2], 'threshold_exceeded')
+    return {result, 'exceeded'}
+else
+    return {result, 'ok'}
+end
+```
+
+#### 3. Handle nil values carefully
+
+```lua
+local value = redis.call('GET', KEYS[1])
+if not value then
+    value = 0  -- Default value
+end
+return tonumber(value) + tonumber(ARGV[1])
+```
+
+#### 4. Use local variables
+
+```lua
+-- GOOD: Use local variables
+local key = KEYS[1]
+local increment = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', key) or 0)
+return redis.call('SET', key, current + increment)
+
+-- AVOID: Repeated table lookups
+return redis.call('SET', KEYS[1], tonumber(redis.call('GET', KEYS[1]) or 0) + tonumber(ARGV[1]))
+```
+
+#### 5. Keep scripts short and focused
+
+```lua
+-- GOOD: Single responsibility
+-- Atomic counter with max value
+local current = tonumber(redis.call('GET', KEYS[1]) or 0)
+local max = tonumber(ARGV[1])
+if current < max then
+    return redis.call('INCR', KEYS[1])
+else
+    return max
+end
+
+-- AVOID: Complex multi-purpose scripts that could be split
+```
+
+### Common Lua scripting patterns
+
+#### Pattern 1: Distributed lock with timeout
+
+```lua
+-- Acquire lock only if not already held
+local lock_key = KEYS[1]
+local lock_value = ARGV[1]
+local ttl = tonumber(ARGV[2])
+
+local result = redis.call('SET', lock_key, lock_value, 'NX', 'EX', ttl)
+if result then
+    return 1
+else
+    return 0
+end
+```
+
+#### Pattern 2: Leaky bucket rate limiter
+
+```lua
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local leak_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+-- Get last update time and current level
+local last_update = tonumber(redis.call('HGET', key, 'last_update') or now)
+local level = tonumber(redis.call('HGET', key, 'level') or 0)
+
+-- Calculate leaked amount
+local elapsed = now - last_update
+local leaked = elapsed * leak_rate
+level = math.max(0, level - leaked)
+
+-- Try to add request
+if level < capacity then
+    level = level + 1
+    redis.call('HMSET', key, 'level', level, 'last_update', now)
+    redis.call('EXPIRE', key, 3600)
+    return 1
+else
+    return 0
+end
+```
+
+#### Pattern 3: Conditional list append
+
+```lua
+-- Append to list only if total size doesn't exceed max
+local list_key = KEYS[1]
+local max_size = tonumber(ARGV[1])
+local value = ARGV[2]
+
+local current_size = redis.call('LLEN', list_key)
+if current_size < max_size then
+    redis.call('RPUSH', list_key, value)
+    return current_size + 1
+else
+    return -1  -- Indicate failure
+end
+```
+
+---
+
+## Chapter 38: Geospatial Commands - Location-Based Queries
+
+**What are Redis Geospatial commands?**
+
+Redis provides specialized commands for storing and querying geographic coordinates using Sorted Sets with Geohash encoding. These commands enable efficient proximity searches, distance calculations, and location-based services.
+
+> **Internals Reference:** See Chapter 24 for Geohash algorithm details, including 2D coordinate encoding, bit interleaving, and spatial indexing.
+
+**When to use Geospatial:**
+- Location-based services (find nearby places)
+- Delivery and ride-sharing applications
+- Store/restaurant locators
+- Geo-fencing and proximity alerts
+- Real-time tracking systems
+
+### Real-world use cases
+
+#### 1. Restaurant finder
+```bash
+# Add restaurants with coordinates
+GEOADD restaurants 77.5946 12.9716 "Bangalore_Restaurant" 72.8777 19.0760 "Mumbai_Cafe"
+
+# Find restaurants within 500km of user
+GEORADIUS restaurants 77.5 13.0 500 km WITHDIST
+```
+
+#### 2. Ride-sharing driver matching
+```bash
+# Add available drivers
+GEOADD drivers 77.6001 12.9345 "driver:123" 77.6100 12.9400 "driver:456"
+
+# Find drivers within 2km of passenger
+GEORADIUS drivers 77.6050 12.9370 2 km WITHCOORD WITHDIST
+```
+
+#### 3. Store locator
+```bash
+# Add store locations
+GEOADD stores -122.4194 37.7749 "SF_Store" -118.2437 34.0522 "LA_Store"
+
+# Get 5 nearest stores to user location
+GEORADIUS stores -122.4000 37.7800 50 km COUNT 5 ASC
+```
+
+### Geospatial commands deep dive
+
+#### GEOADD - Add locations
+```bash
+GEOADD key longitude latitude member [longitude latitude member ...]
+```
+
+**Important:** Longitude comes before latitude (X before Y)
+
+**Valid ranges:**
+- Longitude: -180 to 180 degrees
+- Latitude: -85.05112878 to 85.05112878 degrees
+
+```bash
+GEOADD cities 77.5946 12.9716 "Bangalore" 72.8777 19.0760 "Mumbai"
+# Returns: (integer) 2
+```
+
+#### Practical CLI Example: Geospatial Operations
+
+```redis
+127.0.0.1:6379> GEOADD maps 72.585022 23.033863 Ahmedabad
+(integer) 1
+127.0.0.1:6379> GEOADD maps 72.877426 19.076090 Mumbai 77.594562 12.971420 Bangalore
+(integer) 2
+127.0.0.1:6379> zrange maps 0 -1
+1) "Bangalore"
+2) "Mumbai"
+3) "Ahmedabad"
+
+127.0.0.1:6379> GEOHASH maps Ahmedabad
+1) "ts59nvcK8"
+
+127.0.0.1:6379> GEOPOS maps Ahmedabad
+1) 1) "72.58502233864136"
+   2) "23.033864180583168"
+
+127.0.0.1:6379> GEOADD maps 73.856255 18.516726 Pune
+(integer) 1
+127.0.0.1:6379> zrange maps 0 -1
+1) "Bangalore"
+2) "Mumbai"
+3) "Pune"
+4) "Ahmedabad"
+
+127.0.0.1:6379> GEODIST maps Mumbai Pune
+"120837.5912"
+127.0.0.1:6379> GEODIST maps Mumbai Pune km
+"120.8376"
+127.0.0.1:6379> GEODIST maps Mumbai Pune mi
+"75.0860"
+127.0.0.1:6379> GEODIST maps Mumbai Ahmedabad km
+"441.2531"
+```
+
+#### GEOPOS - Get coordinates of locations
+```bash
+GEOPOS key member [member ...]
+```
+
+```bash
+GEOPOS cities "Bangalore" "Mumbai"
+# Returns:
+# 1) 1) "77.59465605020523071"
+#    2) "12.97159894623566846"
+# 2) 1) "72.87770152092576027"
+#    2) "19.07599971824207629"
+```
+
+#### GEODIST - Calculate distance between locations
+```bash
+GEODIST key member1 member2 [unit]
+```
+
+**Units:** `m` (meters), `km` (kilometers), `mi` (miles), `ft` (feet)
+
+```bash
+GEODIST cities "Bangalore" "Mumbai" km
+# Returns: "842.2891"
+
+GEODIST cities "Bangalore" "Mumbai" mi
+# Returns: "523.4218"
+```
+
+#### GEORADIUS - Find locations within radius
+```bash
+GEORADIUS key longitude latitude radius unit [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count] [ASC|DESC] [STORE key] [STOREDIST key]
+```
+
+**Options:**
+- `WITHCOORD`: Include coordinates in results
+- `WITHDIST`: Include distance from center
+- `WITHHASH`: Include geohash integer
+- `COUNT`: Limit results
+- `ASC|DESC`: Sort by distance
+- `STORE`: Store result locations in another key
+- `STOREDIST`: Store result distances in sorted set
+
+```bash
+# Find cities within 500km of coordinates
+GEORADIUS cities 77.0 13.0 500 km WITHDIST WITHCOORD ASC
+# Returns:
+# 1) 1) "Bangalore"
+#    2) "68.8947"
+#    3) 1) "77.59465605020523071"
+#       2) "12.97159894623566846"
+```
+
+```bash
+# Find 3 nearest cities
+GEORADIUS cities 77.0 13.0 1000 km COUNT 3 ASC
+```
+
+#### GEORADIUSBYMEMBER - Find locations within radius of a member
+```bash
+GEORADIUSBYMEMBER key member radius unit [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count] [ASC|DESC] [STORE key] [STOREDIST key]
+```
+
+**Use case:** Find locations near a known member
+
+```bash
+# Find cities within 500km of Bangalore
+GEORADIUSBYMEMBER cities "Bangalore" 500 km WITHDIST
+# Returns:
+# 1) 1) "Bangalore"
+#    2) "0.0000"
+# 2) 1) "Hyderabad"
+#    2) "498.2341"
+```
+
+#### GEOHASH - Get geohash string representation
+```bash
+GEOHASH key member [member ...]
+```
+
+**Returns:** Base32 geohash string (11 characters)
+
+```bash
+GEOHASH cities "Bangalore" "Mumbai"
+# Returns:
+# 1) "tdnu2scrn00"
+# 2) "te7t96hppz0"
+```
+
+**Note:** Geohashes with similar prefixes are geographically close.
+
+#### GEOSEARCH / GEOSEARCHSTORE - Modern radius search (Redis 6.2+)
+
+```bash
+GEOSEARCH key FROMMEMBER member | FROMLONLAT longitude latitude BYRADIUS radius unit | BYBOX width height unit [ASC|DESC] [COUNT count] [WITHCOORD] [WITHDIST] [WITHHASH]
+```
+
+**More flexible than GEORADIUS:**
+
+```bash
+# Search by radius from member
+GEOSEARCH cities FROMMEMBER "Bangalore" BYRADIUS 500 km WITHDIST
+
+# Search by bounding box
+GEOSEARCH cities FROMLONLAT 77.0 13.0 BYBOX 400 400 km ASC COUNT 5
+
+# Store results
+GEOSEARCHSTORE nearby_cities cities FROMLONLAT 77.0 13.0 BYRADIUS 300 km
+```
+
+### Geospatial implementation details
+
+**Under the hood:**
+- Geospatial data stored in Sorted Sets
+- Scores are 52-bit geohash integers
+- Standard sorted set commands work on geo keys
+
+```bash
+GEOADD cities 77.5946 12.9716 "Bangalore"
+
+# Equivalent to:
+ZADD cities 3481342659657022 "Bangalore"
+
+# You can use sorted set commands:
+ZRANGE cities 0 -1                        # List all cities
+ZREM cities "Bangalore"                   # Remove city
+ZSCORE cities "Mumbai"                    # Get geohash score
+```
+
+**Memory efficiency:**
+- Each location uses ~40 bytes (member string + 8-byte score)
+- Efficient for millions of locations
+- No additional indexing structures needed
+
+### Best practices for geospatial queries
+
+#### 1. Choose appropriate radius
+
+```bash
+# TOO LARGE: May return thousands of results
+GEORADIUS cities 77.0 13.0 5000 km        # Half of Earth
+
+# BETTER: Reasonable search radius
+GEORADIUS cities 77.0 13.0 50 km COUNT 10 # Nearby locations
+```
+
+#### 2. Use COUNT to limit results
+
+```bash
+GEORADIUS cities 77.0 13.0 100 km COUNT 5 ASC  # Get 5 nearest only
+```
+
+#### 3. Store and reuse search results
+
+```bash
+# Store search results for reuse
+GEORADIUS cities 77.0 13.0 100 km STORE search_result
+
+# Use stored results
+ZRANGE search_result 0 -1
+```
+
+#### 4. Combine with other Redis data structures
+
+```bash
+# Get nearby drivers and check availability
+GEORADIUS drivers 77.6 12.9 5 km WITHCOORD | while read driver; do
+    HGET driver_status "$driver"
+done
+```
+
+#### 5. Clean up old locations periodically
+
+```bash
+# Remove inactive locations using sorted set commands
+ZREM cities "OldCity1" "OldCity2"
+```
+
+---
+
+## Chapter 39: Performance Considerations and Best Practices
+
+This chapter synthesizes best practices for using Redis data structures efficiently in production systems, focusing on performance optimization, memory management, and design patterns.
+
+### Memory optimization strategies
+
+#### String optimization
+
+**Best practices:**
+- Use appropriate data types (prefer INCR over SET for counters)
+- Set expiration times for temporary data
+- Use compression for large text values
+- Consider shared objects for frequently repeated values
+
+```bash
+# GOOD: Use INCR for counters
+INCR page_views:home
+
+# AVOID: GET, increment, SET (3 operations, not atomic)
+GET page_views:home
+# ... increment in application ...
+SET page_views:home 1001
+
+# GOOD: Set TTL for session data
+SETEX session:abc123 3600 "user_data"
+
+# AVOID: Separate SET and EXPIRE
+SET session:abc123 "user_data"
+EXPIRE session:abc123 3600
+```
+
+**Memory impact:**
+
+| Approach | Memory per key | Example |
+|----------|---------------|---------|
+| String with JSON | ~100-500 bytes | `SET user:1 '{"name":"Alice","age":30}'` |
+| Hash | ~50-100 bytes | `HMSET user:1 name Alice age 30` |
+| Compressed string | ~30-150 bytes | Use application-level compression |
+
+#### List optimization
+
+**Best practices:**
+- Trim lists regularly with LTRIM to control memory usage
+- Use blocking operations (BLPOP/BRPOP) for real-time processing
+- Consider Redis Streams for complex message queuing
+- Monitor list length and set maximum sizes
+
+```bash
+# GOOD: Maintain fixed-size activity feed
+LPUSH timeline:user:123 "new_activity"
+LTRIM timeline:user:123 0 99              # Keep latest 100 items
+
+# GOOD: Worker with blocking pop (no busy-waiting)
+BRPOP jobs:queue 30                       # Block for 30 seconds
+
+# AVOID: Unbounded list growth
+LPUSH logs:all "log_entry"                # Can grow indefinitely
+```
+
+**List encoding optimization:**
+
+Redis automatically uses ziplist encoding for small lists:
+- `list-max-ziplist-size` (default: -2, ~8KB per node)
+- `list-compress-depth` (default: 0, no compression)
+
+```bash
+# Check encoding
+OBJECT ENCODING mylist                    # Returns: "quicklist" or "ziplist"
+
+# Memory usage
+MEMORY USAGE mylist                       # Returns bytes used
+```
+
+#### Set and Sorted Set optimization
+
+**Best practices:**
+- Monitor set cardinality - very large sets impact performance
+- Use appropriate operations (SSCAN for large set iteration)
+- Consider data partitioning for massive sorted sets
+- Use ZPOPMIN/ZPOPMAX for priority queue patterns
+
+```bash
+# GOOD: Iterate large sets with cursor
+SSCAN large_set 0 COUNT 100
+
+# AVOID: SMEMBERS on large sets
+SMEMBERS large_set                        # Blocks Redis for large sets
+
+# GOOD: Partition large sorted sets
+ZADD leaderboard:shard:0 100 "player1"
+ZADD leaderboard:shard:1 200 "player2"
+
+# GOOD: Priority queue pattern
+ZADD tasks 1 "low_priority" 5 "high_priority"
+ZPOPMAX tasks                             # Always get highest priority
+```
+
+**Sorted set encoding:**
+
+- Uses ziplist for small sorted sets (configurable)
+- `zset-max-ziplist-entries` (default: 128)
+- `zset-max-ziplist-value` (default: 64 bytes)
+
+#### Hash optimization
+
+**Best practices:**
+- Keep individual hashes small (< 100 fields) for memory optimization
+- Use consistent field naming to reduce overhead
+- Prefer HMGET over multiple HGET calls
+- Consider hash partitioning for large objects
+
+```bash
+# GOOD: Batch field retrieval
+HMGET user:123 name email age
+
+# AVOID: Multiple round trips
+HGET user:123 name
+HGET user:123 email
+HGET user:123 age
+
+# GOOD: Partition large hash
+HSET user:123:profile name "Alice" email "alice@example.com"
+HSET user:123:stats login_count 42 posts_count 156
+
+# AVOID: Single massive hash
+HSET user:123 field1 val1 field2 val2 ... field1000 val1000
+```
+
+**Hash encoding optimization:**
+
+- `hash-max-ziplist-entries` (default: 512)
+- `hash-max-ziplist-value` (default: 64 bytes)
+
+**Memory comparison:**
+
+```bash
+# 1000 small hashes (100 fields each)
+# Uses ziplist encoding: ~50KB per hash = 50MB total
+
+# 1 large hash (100,000 fields)
+# Uses hash table encoding: ~100MB total
+
+# Conclusion: Prefer multiple small hashes over one massive hash
+```
+
+### Choosing the right data structure
+
+#### Decision flowchart
+
+```
+Need to store data?
+├─ Simple value (text, number, binary)
+│  └─ Use STRING
+├─ Ordered collection?
+│  ├─ Need unique elements?
+│  │  ├─ Need scoring/ranking?
+│  │  │  └─ Use SORTED SET (leaderboards, time-series)
+│  │  └─ No scoring needed
+│  │     └─ Use SET (tags, relationships)
+│  └─ Allow duplicates?
+│     └─ Use LIST (queues, activity feeds)
+├─ Key-value pairs (object-like)?
+│  └─ Use HASH (user profiles, products)
+├─ Track yes/no for many items?
+│  └─ Use BITMAP (user activity, feature flags)
+├─ Count unique items (huge scale)?
+│  └─ Use HYPERLOGLOG (unique visitors)
+└─ Event log with guaranteed delivery?
+   └─ Use STREAM (event sourcing, message queues)
+```
+
+#### Use case to data structure mapping
+
+| Use Case | Primary Structure | Alternative | Reason |
+|----------|------------------|-------------|--------|
+| **User session** | Hash or String | - | Hash for structured data, String for serialized |
+| **Page view counter** | String (INCR) | - | Atomic increments, minimal memory |
+| **Job queue** | List | Stream | List for simple FIFO, Stream for reliability |
+| **Leaderboard** | Sorted Set | - | Score-based ranking, efficient range queries |
+| **User followers** | Set | - | Unique members, set operations (intersection) |
+| **Activity feed** | List | Stream | List for recent items, Stream for history |
+| **Rate limiting** | String or Sorted Set | Lua script | String for fixed window, ZSet for sliding window |
+| **Caching** | String | Hash | String for simple values, Hash for objects |
+| **Daily active users** | Bitmap | HyperLogLog | Bitmap for exact count, HLL for estimates |
+| **Real-time notifications** | Pub/Sub | Stream | Pub/Sub for broadcast, Stream for persistence |
+| **Geospatial search** | Sorted Set (Geo) | - | Built-in geo commands, efficient radius search |
+| **Unique visitor count** | HyperLogLog | Set | HLL for large scale (constant memory) |
+
+### System design patterns
+
+#### Pattern 1: Cache-aside (Lazy loading)
+
+```bash
+# Application pseudocode:
+function getUser(userId) {
+    # Try cache first
+    cached = HGETALL user:{userId}
+    if cached:
+        return cached
+
+    # Cache miss: load from database
+    userData = database.query("SELECT * FROM users WHERE id = ?", userId)
+
+    # Populate cache with TTL
+    HMSET user:{userId} userData
+    EXPIRE user:{userId} 3600
+
+    return userData
+}
+```
+
+**Advantages:**
+- Only requested data is cached
+- Cache failures don't break application
+
+**Disadvantages:**
+- Initial request is slow (cache miss)
+- Potential cache stampede on popular items
+
+#### Pattern 2: Write-through cache
+
+```bash
+# Application pseudocode:
+function updateUser(userId, updates) {
+    # Update database first
+    database.update("UPDATE users SET ... WHERE id = ?", userId, updates)
+
+    # Update cache atomically
+    HMSET user:{userId} updates
+    EXPIRE user:{userId} 3600
+
+    return success
+}
+```
+
+**Advantages:**
+- Cache always consistent with database
+- No stale data
+
+**Disadvantages:**
+- Write latency includes cache update
+- May cache data that's never read
+
+#### Pattern 3: Rate limiting with sliding window (Sorted Set)
+
+```bash
+# Sliding window rate limiter
+function isAllowed(userId, limit, window) {
+    now = currentTimestamp()
+    key = "rate_limit:{userId}"
+
+    # Remove old entries outside window
+    ZREMRANGEBYSCORE key 0 (now - window)
+
+    # Count requests in current window
+    count = ZCARD key
+
+    if count < limit:
+        # Add current request
+        ZADD key now now
+        EXPIRE key window
+        return true
+    else:
+        return false
+}
+```
+
+**Example usage:**
+
+```bash
+# Allow 100 requests per hour (3600 seconds)
+isAllowed("user:123", 100, 3600)
+```
+
+#### Pattern 4: Distributed locking
+
+```bash
+# Acquire lock with unique token
+SET lock:resource unique_token NX EX 30
+
+# Do work...
+
+# Release lock only if we own it (Lua script)
+EVAL """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+""" 1 lock:resource unique_token
+```
+
+**Important:** Always use unique token to prevent releasing someone else's lock.
+
+#### Pattern 5: Leaderboard with user rank
+
+```bash
+# Add/update player score
+ZADD leaderboard 1500 "player:123"
+
+# Get top 10
+ZREVRANGE leaderboard 0 9 WITHSCORES
+
+# Get player rank (0-based)
+ZREVRANK leaderboard "player:123"
+
+# Get players around user (-10 to +10 ranks)
+rank = ZREVRANK leaderboard "player:123"
+ZREVRANGE leaderboard (rank - 10) (rank + 10) WITHSCORES
+```
+
+#### Pattern 6: Session management
+
+```bash
+# Create session with auto-expiration
+HSET session:{token} user_id 123 created_at 1692629576 role "admin"
+EXPIRE session:{token} 3600
+
+# Extend session on activity
+EXPIRE session:{token} 3600
+
+# Get session data
+HGETALL session:{token}
+
+# Destroy session
+DEL session:{token}
+```
+
+#### Pattern 7: Pub/Sub with Streams for reliability
+
+```bash
+# Publisher: Add event to stream
+XADD events * type "order_created" order_id "12345"
+
+# Consumer group: Guaranteed delivery
+XGROUP CREATE events processors $ MKSTREAM
+XREADGROUP GROUP processors worker1 COUNT 10 STREAMS events >
+
+# Process messages...
+
+# Acknowledge processed messages
+XACK events processors 1692629576966-0
+```
+
+**Why Streams over Pub/Sub for reliability:**
+- Message persistence (survives crashes)
+- Consumer groups (multiple workers)
+- Acknowledgments (at-least-once delivery)
+- Message history (replay events)
+
+### Performance tuning tips
+
+#### 1. Pipeline commands to reduce round trips
+
+```bash
+# BAD: 1000 round trips
+for i in range(1000):
+    SET key{i} value{i}
+
+# GOOD: 1 round trip with pipelining
+pipe = redis.pipeline()
+for i in range(1000):
+    pipe.set(f"key{i}", f"value{i}")
+pipe.execute()
+```
+
+> **Internals Reference:** See Chapter 12 for command pipelining implementation details.
+
+#### 2. Use Lua scripting for complex atomic operations
+
+```bash
+# BAD: Multiple round trips, race conditions possible
+count = GET counter
+if count < 100:
+    INCR counter
+
+# GOOD: Atomic with Lua script
+EVAL "local c = tonumber(redis.call('GET', KEYS[1]) or 0); if c < tonumber(ARGV[1]) then return redis.call('INCR', KEYS[1]) else return c end" 1 counter 100
+```
+
+#### 3. Monitor slow commands
+
+```bash
+# Configure slow log
+CONFIG SET slowlog-log-slower-than 10000  # 10ms threshold
+CONFIG SET slowlog-max-len 128
+
+# View slow commands
+SLOWLOG GET 10
+```
+
+#### 4. Use appropriate eviction policies
+
+```bash
+# For cache use cases
+CONFIG SET maxmemory-policy allkeys-lru
+
+# For mixed workload (cache + persistent data)
+CONFIG SET maxmemory-policy volatile-lru
+
+# For least frequently used
+CONFIG SET maxmemory-policy allkeys-lfu
+```
+
+> **Internals Reference:** See Chapter 16-17 for LRU algorithm details and Chapter 27 for LFU implementation.
+
+#### 5. Monitor memory usage
+
+```bash
+# Overall memory stats
+INFO memory
+
+# Per-key memory usage
+MEMORY USAGE mykey
+
+# Find large keys
+redis-cli --bigkeys
+
+# Memory doctor
+MEMORY DOCTOR
+```
+
+#### 6. Use connection pooling
+
+```python
+# BAD: Create connection per request
+def handle_request():
+    r = redis.Redis(host='localhost')
+    r.get('key')
+    r.close()
+
+# GOOD: Connection pool
+pool = redis.ConnectionPool(host='localhost', max_connections=10)
+r = redis.Redis(connection_pool=pool)
+
+def handle_request():
+    r.get('key')  # Reuses connection from pool
+```
+
+### Common anti-patterns to avoid
+
+#### ❌ Anti-pattern 1: Using Redis as primary database without persistence
+
+```bash
+# WRONG: Treating Redis as disk-based database
+# Data loss on restart if AOF/RDB not configured
+```
+
+**Fix:** Enable AOF or RDB persistence for critical data.
+
+#### ❌ Anti-pattern 2: Storing large values in strings
+
+```bash
+# WRONG: 100MB video file in string
+SET video:123 [100MB binary data]
+```
+
+**Fix:** Store large files in object storage (S3), store references in Redis.
+
+#### ❌ Anti-pattern 3: Using KEYS in production
+
+```bash
+# WRONG: Blocks Redis server
+KEYS user:*  # Scans entire keyspace
+```
+
+**Fix:** Use SCAN for safe iteration:
+
+```bash
+SCAN 0 MATCH user:* COUNT 100
+```
+
+#### ❌ Anti-pattern 4: Unbounded list/set growth
+
+```bash
+# WRONG: No size limits
+LPUSH logs:all "log entry"  # Grows forever
+```
+
+**Fix:** Use LTRIM or switch to Streams with MAXLEN:
+
+```bash
+LPUSH logs:all "log entry"
+LTRIM logs:all 0 9999  # Keep latest 10,000
+```
+
+#### ❌ Anti-pattern 5: Not handling connection failures
+
+```python
+# WRONG: No retry logic
+r.get('key')  # Crashes on network error
+```
+
+**Fix:** Use retry with exponential backoff and circuit breaker.
+
+---
+
+### Summary: Data Structure Selection Guide
+
+**Quick reference for interviews:**
+
+| Scenario | Data Structure | Key Commands |
+|----------|---------------|--------------|
+| User session | Hash | HSET, HGETALL, EXPIRE |
+| Counter | String | INCR, INCRBY, GET |
+| Recent items (feed) | List | LPUSH, LRANGE, LTRIM |
+| Unique tags | Set | SADD, SMEMBERS, SINTER |
+| Leaderboard | Sorted Set | ZADD, ZREVRANGE, ZRANK |
+| Job queue | List or Stream | BRPOP (List), XADD/XREADGROUP (Stream) |
+| Cache | String or Hash | SET/GET (String), HSET/HGET (Hash) |
+| Rate limiting | String or Sorted Set | INCR+EXPIRE (fixed), ZADD+ZREMRANGEBYSCORE (sliding) |
+| Feature flags | Bitmap or Set | SETBIT/GETBIT (Bitmap), SADD/SISMEMBER (Set) |
+| Unique visitors (millions) | HyperLogLog | PFADD, PFCOUNT |
+| Geo-location | Sorted Set (Geo) | GEOADD, GEORADIUS |
+| Real-time events | Pub/Sub or Stream | PUBLISH/SUBSCRIBE (Pub/Sub), XADD/XREAD (Stream) |
+| Multi-step atomic ops | Lua Script | EVAL, EVALSHA |
+
+**Performance characteristics:**
+
+| Operation | Time Complexity | Notes |
+|-----------|----------------|-------|
+| GET/SET | O(1) | Constant time |
+| HGET/HSET | O(1) | Hash field access |
+| LPUSH/RPUSH | O(1) | List head/tail |
+| SADD/SREM | O(1) | Set operations |
+| ZADD | O(log N) | Sorted set insert |
+| ZRANGE | O(log N + M) | M = elements returned |
+| LRANGE | O(S + N) | S = offset, N = elements |
+| SMEMBERS | O(N) | Returns all members |
+| GEORADIUS | O(N + log M) | N = items checked, M = results |
+| PFADD | O(1) | HyperLogLog add |
+| PFCOUNT | O(1) | HyperLogLog count |
+
+---
+
+**This completes Part 8: Redis Data Structures - User Guide and Practical Patterns**
+
+You now have a comprehensive understanding of both:
+- **How Redis is built** (Parts 1-7: Internals, algorithms, implementation)
+- **How to use Redis** (Part 8: Commands, patterns, best practices)
+
+This unified guide provides everything needed for:
+- ✅ **System design interviews** (architecture, trade-offs, internals)
+- ✅ **Coding interviews** (commands, data structures, patterns)
+- ✅ **Production development** (best practices, performance optimization)
+- ✅ **Interview preparation** (comprehensive single resource)
 
 ---
