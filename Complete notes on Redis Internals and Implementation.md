@@ -826,5 +826,381 @@ SET: 37,735 requests per second
 
 ---
 
-This comprehensive introduction sets the stage for deep technical exploration. In the following chapters, we'll build Redis from scratch, understanding every decision, trade-off, and optimization that makes it one of the fastest databases in the world.
+---
+
+# Part 2: Building Redis from Scratch
+
+## Chapter 3: Writing a Simple TCP Echo Server
+
+Before implementing Redis's complex event loop, let's understand the basics by building a simple TCP echo server in Go. This foundation will help us appreciate the limitations of blocking I/O and motivate the need for asynchronous I/O.
+
+### Project Setup
+
+**Structure:**
+```
+redis-clone/
+├── go.mod        # No external dependencies
+├── main.go       # Entry point
+└── server/
+    └── tcp.go    # Server implementation
+```
+
+**Starting the server:**
+```bash
+go run main.go
+```
+
+---
+
+### Command-Line Flags
+
+**Configuration via flags:**
+
+```go
+package main
+
+import (
+    "flag"
+    "fmt"
+)
+
+func main() {
+    // Define command-line flags
+    port := flag.Int("port", 7379, "Port to listen on")
+    host := flag.String("host", "0.0.0.0", "Host address to bind")
+
+    flag.Parse()
+
+    fmt.Printf("Starting server on %s:%d\n", *host, *port)
+
+    // Start server
+    startServer(*host, *port)
+}
+```
+
+**Usage:**
+```bash
+# Default: 0.0.0.0:7379
+go run main.go
+
+# Custom port
+go run main.go -port 8080
+
+# Specific host
+go run main.go -host 127.0.0.1 -port 6379
+```
+
+**Why `0.0.0.0`?**
+- Accepts connections from ANY network interface
+- `127.0.0.1`: Localhost only
+- `0.0.0.0`: All interfaces (localhost, external IPs)
+
+---
+
+### TCP Server Implementation (Synchronous/Blocking)
+
+```go
+package server
+
+import (
+    "fmt"
+    "io"
+    "net"
+    "log"
+)
+
+func StartTCPServer(host string, port int) error {
+    // Step 1: Create TCP listener
+    address := fmt.Sprintf("%s:%d", host, port)
+    listener, err := net.Listen("tcp", address)
+    if err != nil {
+        return fmt.Errorf("failed to bind to %s: %v", address, err)
+    }
+    defer listener.Close()
+
+    log.Printf("Server listening on %s", address)
+
+    // Track concurrent clients
+    concurrentClients := 0
+
+    // Step 2: Accept connections in infinite loop
+    for {
+        // BLOCKING CALL: Wait for new connection
+        conn, err := listener.Accept()
+        if err != nil {
+            log.Printf("Error accepting connection: %v", err)
+            continue
+        }
+
+        concurrentClients++
+        log.Printf("New client connected from %s. Total clients: %d",
+                   conn.RemoteAddr(), concurrentClients)
+
+        // Step 3: Handle client communication
+        for {
+            // Read command from client
+            command, err := readCommand(conn)
+            if err != nil {
+                if err == io.EOF {
+                    log.Printf("Client %s disconnected", conn.RemoteAddr())
+                } else {
+                    log.Printf("Error reading from %s: %v", conn.RemoteAddr(), err)
+                }
+
+                conn.Close()
+                concurrentClients--
+                log.Printf("Total clients: %d", concurrentClients)
+                break  // Exit inner loop
+            }
+
+            // Log received command
+            log.Printf("Received command: %s", command)
+
+            // Echo command back to client
+            respond(conn, command)
+        }
+    }
+}
+
+// readCommand reads data from connection
+func readCommand(conn net.Conn) (string, error) {
+    buffer := make([]byte, 1024)
+
+    // BLOCKING CALL: Wait for data
+    n, err := conn.Read(buffer)
+    if err != nil {
+        return "", err
+    }
+
+    return string(buffer[:n]), nil
+}
+
+// respond sends response back to client
+func respond(conn net.Conn, response string) error {
+    _, err := conn.Write([]byte(response))
+    return err
+}
+```
+
+---
+
+### Server Execution Flow
+
+**Step-by-step execution:**
+
+1. **`net.Listen()`**: Creates TCP listener on specified host:port
+   - Binds to network interface
+   - Begins listening for connections
+   - Returns `listener` object
+
+2. **Outer Loop**: `listener.Accept()`
+   - **BLOCKS** until a client connects
+   - Returns `net.Conn` object for that specific client
+   - Increments `concurrentClients` counter
+
+3. **Inner Loop**: Handle client communication
+   - Calls `readCommand(conn)`
+   - **BLOCKS** waiting for data from client
+   - When data arrives, process it (echo back)
+   - Loop continues until client disconnects
+
+4. **Error Handling**:
+   - `io.EOF`: Client disconnected gracefully
+   - Other errors: Connection issues
+   - Close connection, decrement counter, break inner loop
+
+---
+
+### Testing with netcat
+
+**Connect to server:**
+
+```bash
+# Terminal 1: Start server
+go run main.go
+
+# Terminal 2: Connect with netcat
+nc localhost 7379
+```
+
+**Interactive session:**
+```
+$ nc localhost 7379
+hello                    # You type
+hello                    # Server echoes back
+world                    # You type
+world                    # Server echoes back
+hello world              # You type
+hello world              # Server echoes back
+^C                       # Ctrl+C to disconnect
+```
+
+**Server logs:**
+```
+Server listening on 0.0.0.0:7379
+New client connected from 127.0.0.1:52341. Total clients: 1
+Received command: hello
+Received command: world
+Received command: hello world
+Client 127.0.0.1:52341 disconnected
+Total clients: 0
+```
+
+---
+
+### Critical Limitation: Single-Threaded Blocking
+
+**The Problem Revealed:**
+
+```bash
+# Terminal 1: Start server
+go run main.go
+
+# Terminal 2: First client connects
+nc localhost 7379
+hello                    # Works fine
+
+# Terminal 3: Second client tries to connect
+nc localhost 7379        # HANGS! Cannot connect
+```
+
+**Why Second Client Can't Connect:**
+
+The server is **blocked** in the inner loop:
+1. `Accept()` accepted first client
+2. Entered inner loop calling `Read()` on first client's connection
+3. `Read()` blocks waiting for data from first client
+4. Server **cannot** go back to outer loop to call `Accept()` for second client
+5. Second client's connection request queued but never accepted
+
+**Disconnect first client:**
+```bash
+# Terminal 2: Ctrl+C (disconnect first client)
+
+# Terminal 3: NOW second client connects!
+hello                    # Now it works
+```
+
+**Server logs show the sequence:**
+```
+New client connected from 127.0.0.1:52341. Total clients: 1
+# [First client active, server blocked in inner loop]
+Client 127.0.0.1:52341 disconnected. Total clients: 0
+New client connected from 127.0.0.1:52342. Total clients: 1
+# [Second client finally accepted]
+```
+
+---
+
+### Interacting with Redis CLI
+
+**Connecting Redis CLI to our echo server:**
+
+```bash
+# Terminal 1: Start echo server
+go run main.go
+
+# Terminal 2: Connect Redis CLI
+redis-cli -p 7379
+```
+
+**What happens:**
+
+```bash
+127.0.0.1:7379> PING
+# Server receives and echoes: *1\r\n$4\r\nPING\r\n
+```
+
+**Server logs show RESP protocol:**
+```
+New client connected from 127.0.0.1:52343. Total clients: 1
+Received command: *1
+$7
+COMMAND
+
+Received command: *1
+$4
+PING
+```
+
+**RESP Format Observed:**
+```
+*1          # Array with 1 element
+$4          # Bulk string of length 4
+PING        # The command
+\r\n        # CRLF line ending
+```
+
+**More complex command:**
+```bash
+127.0.0.1:7379> SET k v
+```
+
+**Server receives:**
+```
+*3          # Array with 3 elements
+$3          # Bulk string length 3
+SET         # Command
+$1          # Bulk string length 1
+k           # Key
+$1          # Bulk string length 1
+v           # Value
+\r\n        # CRLF endings
+```
+
+This demonstrates that Redis CLI communicates using the **RESP protocol** over raw TCP connections.
+
+---
+
+### Visualizing the Blocking Problem
+
+**Synchronous server behavior:**
+
+```
+Timeline:
+---------------------------------------------------------------------------
+Server:    [Accept] → [Read Client 1] → [Blocked...] → [Client 1 done] → [Accept Client 2]
+Client 1:           Connected ←-------- Active ------→ Disconnect
+Client 2:                      [Waiting...waiting...waiting...] Connected!
+```
+
+**Key observations:**
+
+1. ✅ Server handles ONE client at a time
+2. ❌ Other clients cannot connect during active session
+3. ❌ Scalability is ZERO (only 1 client supported)
+4. ❌ Network utilization is poor (idle during waits)
+
+---
+
+### Summary of Blocking Server
+
+**What We Built:**
+- Simple TCP echo server in Go
+- Accepts connections on configurable host:port
+- Reads data from clients
+- Echoes data back
+- Handles disconnections gracefully
+
+**What We Learned:**
+
+1. **`net.Listen()`**: Creates TCP listener
+2. **`listener.Accept()`**: Blocking call, waits for connections
+3. **`conn.Read()`**: Blocking call, waits for data
+4. **Nested Loops**: Outer for accepting, inner for handling
+5. **File Descriptors**: Connections represented as `net.Conn` objects
+
+**Critical Limitation Identified:**
+
+❌ **Single client support**: Server blocks on first client, cannot accept new connections
+
+**Solution Preview:**
+
+To support multiple concurrent clients, we need:
+1. **Either**: Spawn thread per client (multi-threading approach)
+2. **Or**: Use I/O multiplexing with event loops (Redis's approach)
+
+In the next chapter, we'll implement the **asynchronous event loop** using `epoll`, enabling thousands of concurrent connections on a single thread.
+
+---
 
