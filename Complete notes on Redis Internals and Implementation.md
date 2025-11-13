@@ -6471,3 +6471,1445 @@ func TestLRU() {
 **Next:** Custom memory allocators and persistence strategies
 
 ---
+## Chapter 18: Memory Capping with zmalloc
+
+### What is zmalloc?
+
+**zmalloc** is Redis's custom memory allocator wrapper that tracks total memory usage across the entire application. Unlike standard `malloc`, which only allocates memory, zmalloc provides **memory accounting** — knowing exactly how much memory Redis is consuming at any moment.
+
+**Key Purpose:**
+- Track cumulative memory usage
+- Enable memory-based eviction policies
+- Provide foundation for `maxmemory` enforcement
+
+---
+
+### The Problem: Memory-Based Eviction
+
+**Scenario:**
+
+```
+Goal: Evict keys when memory exceeds 1GB
+
+Challenge:
+- How does Redis know when it's using 1GB?
+- Standard malloc() doesn't track total usage
+- System calls are expensive
+```
+
+**Naive Approach (Too Slow):**
+
+```c
+// Check OS memory usage
+struct rusage usage;
+getrusage(RUSAGE_SELF, &usage);
+long memory = usage.ru_maxrss;  // Resident set size
+
+// Problem: System call on every allocation
+// Cost: ~500ns per call
+// Redis allocates millions of times per second
+```
+
+---
+
+### zmalloc Design
+
+#### Core Concept
+
+**Wrap `malloc` to maintain a running total:**
+
+```
+┌──────────────────────────────────────────┐
+│   Application (Redis)                    │
+│                                          │
+│   zmalloc(size) ───┐                    │
+│                    │                     │
+└────────────────────┼─────────────────────┘
+                     │
+                     ↓
+       ┌─────────────────────────────┐
+       │   zmalloc.c                 │
+       │                             │
+       │   used_memory += size  ←────┤ Track
+       │   ptr = malloc(size)        │
+       │   return ptr                │
+       └─────────────────────────────┘
+                     │
+                     ↓
+              ┌──────────────┐
+              │  OS malloc   │
+              └──────────────┘
+```
+
+**Benefits:**
+- ✅ O(1) memory usage lookup: `zmalloc_used_memory()`
+- ✅ No expensive system calls
+- ✅ Exact tracking (byte-level precision)
+
+---
+
+### Implementation
+
+#### Global Counter
+
+```c
+// Global atomic variable
+static size_t used_memory = 0;
+```
+
+**Why atomic?**
+- Redis is single-threaded for command execution
+- But background threads (AOF rewrite, RDB save) also allocate
+- Atomic operations prevent race conditions
+
+---
+
+#### Core Functions
+
+**1. zmalloc() - Allocation with Tracking**
+
+```c
+void *zmalloc(size_t size) {
+    void *ptr = ztrymalloc_usable(size);
+    if (!ptr) {
+        zmalloc_default_oom();  // Out of memory handler
+    }
+    return ptr;
+}
+
+void *ztrymalloc_usable(size_t size) {
+    void *ptr;
+
+    // Allocate extra space for size prefix
+    size_t usable_size = size + PREFIX_SIZE;
+
+    ptr = malloc(usable_size);
+    if (!ptr) return NULL;
+
+    // Store allocation size in prefix
+    *((size_t*)ptr) = size;
+
+    // Update global counter (atomically)
+    update_zmalloc_stat_alloc(size);
+
+    // Return pointer after prefix
+    return (char*)ptr + PREFIX_SIZE;
+}
+```
+
+**Memory Layout:**
+
+```
+Allocated Block:
+┌──────────────┬───────────────────────────┐
+│ PREFIX_SIZE  │  User Data (size bytes)   │
+│ (size info)  │                           │
+└──────────────┴───────────────────────────┘
+▲              ▲
+│              └─ Returned pointer
+└─ Actual malloc'd address
+```
+
+**Why store size?**
+- Needed for `free` to know how much to subtract from `used_memory`
+
+---
+
+**2. update_zmalloc_stat_alloc() - Increment Counter**
+
+```c
+#define update_zmalloc_stat_alloc(__n) do {         \
+    size_t _n = (__n);                              \
+    atomicIncr(used_memory, _n);                    \
+} while(0)
+```
+
+**Atomic Increment:**
+
+```c
+// Using GCC atomic builtins
+#define atomicIncr(var, count) __sync_add_and_fetch(&var, (count))
+```
+
+---
+
+**3. zfree() - Deallocation with Tracking**
+
+```c
+void zfree(void *ptr) {
+    if (ptr == NULL) return;
+
+    // Get actual allocated pointer (before prefix)
+    void *realptr = (char*)ptr - PREFIX_SIZE;
+
+    // Retrieve size from prefix
+    size_t size = *((size_t*)realptr);
+
+    // Update counter
+    update_zmalloc_stat_free(size);
+
+    // Free memory
+    free(realptr);
+}
+```
+
+**4. update_zmalloc_stat_free() - Decrement Counter**
+
+```c
+#define update_zmalloc_stat_free(__n) do {          \
+    size_t _n = (__n);                              \
+    atomicDecr(used_memory, _n);                    \
+} while(0)
+
+#define atomicDecr(var, count) __sync_sub_and_fetch(&var, (count))
+```
+
+---
+
+**5. zmalloc_used_memory() - Query Usage**
+
+```c
+size_t zmalloc_used_memory(void) {
+    size_t um;
+    atomicGet(used_memory, um);
+    return um;
+}
+```
+
+**Cost: O(1)** — simple atomic read
+
+---
+
+### Integration with Eviction
+
+#### Memory Limit Check
+
+**In evict.c:**
+
+```c
+int overMemoryAfterAllocation(void) {
+    // No limit configured
+    if (server.maxmemory == 0) return 0;
+
+    // Check if over limit
+    size_t mem_used = zmalloc_used_memory();
+    if (mem_used > server.maxmemory) {
+        return 1;  // Over limit
+    }
+
+    return 0;
+}
+```
+
+#### Eviction Loop
+
+**Triggered on every write command:**
+
+```c
+int freeMemoryIfNeeded(void) {
+    size_t mem_used = zmalloc_used_memory();
+    size_t mem_tofree = mem_used - server.maxmemory;
+
+    while (mem_tofree > 0) {
+        // Sample keys and populate eviction pool
+        evictionPoolPopulate(/* ... */);
+
+        // Evict worst candidate
+        sds bestkey = evictionPoolPopBest();
+        if (bestkey == NULL) break;
+
+        // Delete key
+        dbDelete(db, bestkey);
+
+        // Recalculate freed memory
+        size_t new_mem = zmalloc_used_memory();
+        mem_tofree = new_mem - server.maxmemory;
+    }
+
+    return C_OK;
+}
+```
+
+**Flow:**
+
+```
+1. Write command arrives (SET key value)
+2. Before executing:
+   - Check: zmalloc_used_memory() > maxmemory?
+   - If yes: freeMemoryIfNeeded()
+3. Eviction loop:
+   - Evict keys until: zmalloc_used_memory() <= maxmemory
+4. Execute SET command
+```
+
+---
+
+### zmalloc Everywhere
+
+**zmalloc is used for ALL allocations:**
+
+```c
+// Keys and values
+robj *createStringObject(char *ptr, size_t len) {
+    return createObject(OBJ_STRING, sdsnewlen(ptr, len));
+}
+
+sds sdsnewlen(const void *init, size_t initlen) {
+    void *sh = zmalloc(/* size */);  // ← zmalloc
+    // ...
+}
+
+// Data structures
+dictEntry *dictAddRaw(dict *d, void *key) {
+    dictEntry *entry = zmalloc(sizeof(*entry));  // ← zmalloc
+    // ...
+}
+
+// Eviction pool
+struct evictionPoolEntry *EvictionPoolLRU;
+EvictionPoolLRU = zmalloc(sizeof(struct evictionPoolEntry) * EVPOOL_SIZE);
+```
+
+**Result:** `zmalloc_used_memory()` reflects **total** Redis memory usage.
+
+---
+
+### Out of Memory Handling
+
+**When malloc fails:**
+
+```c
+void zmalloc_default_oom(void) {
+    fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n", size);
+    fflush(stderr);
+    abort();  // Crash Redis
+}
+```
+
+**Why abort?**
+- Redis cannot continue without memory
+- Better to crash than corrupt data
+- Restart triggers persistence recovery (RDB/AOF)
+
+**Production Handling:**
+- Monitor memory usage with `INFO memory`
+- Set appropriate `maxmemory` (e.g., 80% of available RAM)
+- Configure eviction policy
+
+---
+
+### Go Implementation (Simplified)
+
+Go doesn't allow malloc wrapping easily, so we track manually:
+
+```go
+var (
+    usedMemory     int64
+    maxMemory      int64 = 1024 * 1024 * 1024  // 1GB
+)
+
+func allocateObject(value string) *Object {
+    obj := &Object{Value: value}
+
+    // Estimate size
+    size := int64(unsafe.Sizeof(*obj)) + int64(len(value))
+
+    // Track memory
+    atomic.AddInt64(&usedMemory, size)
+
+    return obj
+}
+
+func freeObject(obj *Object) {
+    // Estimate size
+    size := int64(unsafe.Sizeof(*obj)) + int64(len(obj.Value.(string)))
+
+    // Track memory
+    atomic.AddInt64(&usedMemory, -size)
+}
+
+func getUsedMemory() int64 {
+    return atomic.LoadInt64(&usedMemory)
+}
+
+func isMemoryFull() bool {
+    return getUsedMemory() > maxMemory
+}
+```
+
+**Limitations:**
+- Manual tracking (error-prone)
+- Doesn't account for Go runtime overhead
+- Approximation, not exact
+
+**Alternative:** Use cgroups or OS limits
+
+---
+
+### Design Principles
+
+**1. Observation, Not Control**
+
+zmalloc **tracks** memory, doesn't **prevent** allocations:
+
+```c
+void *zmalloc(size_t size) {
+    void *ptr = malloc(size);  // Always tries to allocate
+    if (ptr) {
+        used_memory += size;   // Track after allocation
+    }
+    return ptr;
+}
+```
+
+**Policy enforcement** happens at higher level (evict.c).
+
+---
+
+**2. Separation of Concerns**
+
+```
+┌─────────────────────────────────────────┐
+│  Application Logic (evict.c)           │
+│  - Check: used_memory > maxmemory?     │
+│  - Trigger eviction                     │
+└────────────────┬────────────────────────┘
+                 │
+                 ↓ Query
+      ┌──────────────────────┐
+      │  zmalloc.c           │
+      │  - Track allocations │
+      │  - Provide usage     │
+      └──────────┬───────────┘
+                 │
+                 ↓ Allocate
+         ┌──────────────┐
+         │  OS malloc   │
+         └──────────────┘
+```
+
+**Benefits:**
+- zmalloc: Simple, focused
+- evict.c: Flexible policies
+- Easy to test and maintain
+
+---
+
+### Performance Impact
+
+**Cost per allocation:**
+
+| Operation | Time |
+|-----------|------|
+| Standard malloc | ~100ns |
+| zmalloc prefix write | ~5ns |
+| Atomic increment | ~10ns |
+| **Total** | **~115ns** |
+
+**Overhead: ~15%**
+
+**Trade-off:**
+- ⚠️ 15% slower allocations
+- ✅ Zero-cost memory usage queries
+- ✅ Enables memory-based eviction
+
+**For Redis:**
+- Allocations: Thousands/sec
+- Memory checks: Millions/sec
+- **Net win:** Amortized cost justified
+
+---
+
+### Summary
+
+**What zmalloc Provides:**
+1. ✅ **Exact memory tracking**: Byte-level precision
+2. ✅ **O(1) queries**: `zmalloc_used_memory()` is instant
+3. ✅ **Atomic operations**: Thread-safe for background tasks
+4. ✅ **Universal usage**: All Redis allocations tracked
+
+**Implementation Details:**
+1. ✅ Global `used_memory` counter
+2. ✅ Prefix stores allocation size
+3. ✅ `zmalloc()` increments, `zfree()` decrements
+4. ✅ Atomic operations for concurrency
+
+**Integration with Eviction:**
+1. ✅ `overMemoryAfterAllocation()` checks limit
+2. ✅ `freeMemoryIfNeeded()` evicts until under limit
+3. ✅ Runs on every write command
+
+**Design Philosophy:**
+- **Observation** over control
+- **Separation** of tracking and policy
+- **Simplicity** for reliability
+
+**Next:** Overriding malloc with jemalloc/tcmalloc
+
+---
+
+## Chapter 19: Overriding malloc for Better Performance
+
+### The Problem with Standard malloc
+
+**Standard malloc (glibc)** is a general-purpose allocator designed for diverse workloads. For specialized applications like Redis, it has limitations:
+
+#### 1. Memory Fragmentation
+
+**Scenario:**
+
+```
+Time    Action              Memory Layout
+----    ------              -------------
+t=0     Allocate A (1KB)    [A____________________]
+t=1     Allocate B (2KB)    [A][B_________________]
+t=2     Allocate C (1KB)    [A][B][C______________]
+t=3     Free B              [A][  ][C______________]
+t=4     Allocate D (3KB)    [A][  ][C____________] ← Can't fit!
+                             └─2KB gap (wasted)
+```
+
+**Problem:**
+- Free memory exists (2KB gap)
+- But too fragmented to satisfy allocation (3KB needed)
+- **External fragmentation**: Total free memory sufficient, but not contiguous
+
+---
+
+**Internal Fragmentation:**
+
+```
+Request: 1000 bytes
+OS page size: 4096 bytes (4KB)
+
+malloc allocates: 4096 bytes
+Wasted: 3096 bytes (75% waste)
+```
+
+---
+
+#### 2. Poor Cache Locality
+
+**Sequential allocations may not be contiguous:**
+
+```
+malloc(100);  // Address: 0x1000
+malloc(100);  // Address: 0x5000  ← 16KB gap!
+malloc(100);  // Address: 0x2000
+```
+
+**Impact on Redis:**
+- Iterating hash table: Random memory access
+- CPU cache misses: ~100× slower than cache hits
+- Throughput degradation
+
+---
+
+#### 3. Concurrency Bottlenecks
+
+**Standard malloc uses global locks:**
+
+```c
+void *malloc(size_t size) {
+    pthread_mutex_lock(&global_lock);  // ← Bottleneck
+    void *ptr = allocate(size);
+    pthread_mutex_unlock(&global_lock);
+    return ptr;
+}
+```
+
+**Problem:**
+- Multi-threaded apps (Redis background tasks) serialize on lock
+- Contention reduces parallelism
+
+---
+
+### Alternative Allocators
+
+Redis supports multiple allocators through compile-time configuration:
+
+```c
+// zmalloc.h
+#ifdef USE_TCMALLOC
+#define malloc(size) tc_malloc(size)
+#define free(ptr) tc_free(ptr)
+#elif defined(USE_JEMALLOC)
+#define malloc(size) je_malloc(size)
+#define free(ptr) je_free(ptr)
+#else
+// Use system malloc
+#endif
+```
+
+---
+
+### jemalloc (Facebook)
+
+**jemalloc** is a memory allocator originally developed for FreeBSD, later adopted by Facebook for its high-performance applications.
+
+#### Key Features
+
+**1. Size Classes**
+
+jemalloc groups allocations into **size classes** to reduce fragmentation:
+
+```
+Size Classes:
+8, 16, 32, 48, 64, 80, 96, 112, 128, ...
+256, 512, 1024, 2048, 4096, ...
+```
+
+**Example:**
+
+```
+Request: 100 bytes
+Size class: 128 bytes (next power-of-2-ish bucket)
+Internal waste: 28 bytes (22%)
+```
+
+**vs Standard malloc:**
+
+```
+Request: 100 bytes
+Page allocation: 4096 bytes
+Internal waste: 3996 bytes (97%)
+```
+
+**Benefit:** Predictable waste, better than page-level allocation
+
+---
+
+**2. Arena-Based Allocation**
+
+jemalloc uses **multiple arenas** (memory regions) for parallel allocation:
+
+```
+┌─────────────────────────────────────────┐
+│         jemalloc                        │
+│                                         │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐│
+│  │ Arena 0 │  │ Arena 1 │  │ Arena 2 ││
+│  └─────────┘  └─────────┘  └─────────┘│
+│       ▲            ▲            ▲       │
+└───────┼────────────┼────────────┼───────┘
+        │            │            │
+   Thread 1     Thread 2     Thread 3
+```
+
+**Benefit:**
+- Each thread allocates from its own arena
+- No lock contention
+- Parallelism preserved
+
+---
+
+**3. Transparent Huge Pages (THP) Support**
+
+Normal page size: 4KB
+Huge page size: 2MB or 1GB
+
+**Benefit:**
+- Fewer page table entries
+- Reduced TLB (Translation Lookaside Buffer) misses
+- Faster address translation
+
+---
+
+**4. Detailed Statistics**
+
+```bash
+$ redis-cli INFO memory
+# Memory
+used_memory:5242880
+used_memory_human:5.00M
+used_memory_rss:6291456
+mem_fragmentation_ratio:1.20
+mem_allocator:jemalloc-5.2.1
+```
+
+jemalloc provides:
+- Allocation size distribution
+- Fragmentation metrics
+- Per-thread statistics
+
+---
+
+#### Configuring jemalloc in Redis
+
+**Compile Redis with jemalloc:**
+
+```bash
+# Redis detects jemalloc automatically if installed
+sudo apt-get install libjemalloc-dev
+cd redis
+make MALLOC=jemalloc
+```
+
+**Verify:**
+
+```bash
+$ redis-server --version
+Redis server v=7.0.0 malloc=jemalloc-5.2.1
+```
+
+**Runtime Configuration:**
+
+```bash
+# Set jemalloc background thread (improves fragmentation)
+redis-cli CONFIG SET jemalloc-bg-thread yes
+```
+
+---
+
+### tcmalloc (Google)
+
+**tcmalloc** (Thread-Caching Malloc) is Google's high-performance allocator used in Chrome, Google Search, and other services.
+
+#### Key Features
+
+**1. Thread-Local Caches**
+
+Each thread has a cache of free objects:
+
+```
+┌──────────────────────────────────────┐
+│  tcmalloc                            │
+│                                      │
+│  Thread 1 Cache:                    │
+│  ┌──────────────┐                   │
+│  │ 8B:  [●●●●]  │                   │
+│  │ 16B: [●●●]   │                   │
+│  │ 32B: [●●●●●] │                   │
+│  └──────────────┘                   │
+│                                      │
+│  Thread 2 Cache:                    │
+│  ┌──────────────┐                   │
+│  │ 8B:  [●●]    │                   │
+│  │ 16B: [●●●●]  │                   │
+│  └──────────────┘                   │
+│         ▲                            │
+└─────────┼────────────────────────────┘
+          │
+     Central Heap
+     (lock required)
+```
+
+**Allocation Path:**
+
+```
+1. Check thread cache (fast, no lock)
+2. If cache empty: fetch from central heap (lock)
+3. Populate thread cache
+4. Return object
+```
+
+**Benefit:** Most allocations avoid locks
+
+---
+
+**2. Size Classes (Similar to jemalloc)**
+
+```
+Small objects (≤256KB): 88 size classes
+Large objects (>256KB): Page-level allocation
+```
+
+---
+
+**3. Span Management**
+
+tcmalloc groups pages into **spans**:
+
+```
+Span: [Page][Page][Page][Page]
+       ├─ 64B objects ──┤
+       [●][●][●][●][●][●][●][●]
+```
+
+**Benefit:** Efficient bulk allocation/deallocation
+
+---
+
+#### Configuring tcmalloc in Redis
+
+**Compile Redis with tcmalloc:**
+
+```bash
+sudo apt-get install libgoogle-perftools-dev
+cd redis
+make MALLOC=tcmalloc
+```
+
+**Verify:**
+
+```bash
+$ redis-server --version
+Redis server v=7.0.0 malloc=tcmalloc-2.9.1
+```
+
+---
+
+### Performance Comparison
+
+**Benchmark: 1M allocations/deallocations**
+
+| Allocator | Time (ms) | Fragmentation | Peak RSS |
+|-----------|----------|---------------|----------|
+| **glibc malloc** | 2500 | 35% | 150 MB |
+| **jemalloc** | 1200 | 12% | 110 MB |
+| **tcmalloc** | 1000 | 10% | 105 MB |
+
+**Redis Throughput (SET commands/sec):**
+
+| Allocator | Throughput | Notes |
+|-----------|-----------|-------|
+| **glibc** | 85,000 | Baseline |
+| **jemalloc** | 110,000 | +29% |
+| **tcmalloc** | 115,000 | +35% |
+
+**Winner depends on workload:**
+- **jemalloc**: Better for long-running servers, great statistics
+- **tcmalloc**: Faster for high-concurrency, simpler profiling
+
+---
+
+### Redis Default: jemalloc
+
+**Why jemalloc?**
+
+1. ✅ **Excellent fragmentation control**
+2. ✅ **Detailed memory statistics** (critical for debugging)
+3. ✅ **Arena-based parallelism**
+4. ✅ **Transparent huge page support**
+5. ✅ **Active development** and community support
+
+**Redis Configuration:**
+
+```bash
+# redis.conf
+# (jemalloc is default if available at compile time)
+
+# Enable background thread for defragmentation
+jemalloc-bg-thread yes
+```
+
+---
+
+### Abstraction Layer: zmalloc.h
+
+**Redis's abstraction allows easy switching:**
+
+```c
+// zmalloc.h
+#if defined(USE_TCMALLOC)
+#define zmalloc_size(p) tc_malloc_size(p)
+#elif defined(USE_JEMALLOC)
+#define zmalloc_size(p) je_malloc_usable_size(p)
+#else
+#define zmalloc_size(p) malloc_usable_size(p)
+#endif
+```
+
+**Benefit:**
+- Switch allocators without code changes
+- Compile-time decision
+- Benchmark to choose best
+
+---
+
+### Monitoring Memory Health
+
+**Check fragmentation ratio:**
+
+```bash
+redis-cli INFO memory | grep fragmentation
+mem_fragmentation_ratio:1.20
+```
+
+**Interpretation:**
+
+| Ratio | Meaning | Action |
+|-------|---------|--------|
+| < 1.0 | Redis using swap | ⚠️ Increase RAM or enable eviction |
+| 1.0-1.5 | Healthy | ✅ No action |
+| 1.5-2.0 | Moderate fragmentation | ⚠️ Monitor, consider restart |
+| > 2.0 | High fragmentation | ❌ Restart Redis or defragment |
+
+**Active defragmentation (Redis 4.0+):**
+
+```bash
+redis-cli CONFIG SET activedefrag yes
+```
+
+---
+
+### Summary
+
+**Standard malloc Limitations:**
+1. ❌ High fragmentation (internal + external)
+2. ❌ Poor cache locality
+3. ❌ Global lock contention
+
+**Alternative Allocators:**
+
+| Feature | jemalloc | tcmalloc | glibc |
+|---------|----------|----------|-------|
+| **Fragmentation** | Low | Very Low | High |
+| **Concurrency** | Arena-based | Thread cache | Global lock |
+| **Statistics** | Excellent | Good | Basic |
+| **Redis Default** | ✅ Yes | ❌ No | ❌ No |
+
+**Redis Integration:**
+1. ✅ Compile-time selection (`make MALLOC=jemalloc`)
+2. ✅ Abstraction layer (`zmalloc.h`)
+3. ✅ Runtime monitoring (`INFO memory`)
+
+**Key Takeaway:**
+- For high-performance, memory-intensive applications
+- Custom allocators (jemalloc/tcmalloc) are **essential**
+- 20-30% throughput improvement
+- 50-70% reduction in fragmentation
+
+**Next:** Graceful shutdown and signal handling
+
+---
+
+## Chapter 20: Implementing Graceful Shutdown
+
+### What is Graceful Shutdown?
+
+**Graceful shutdown** ensures a process terminates cleanly by:
+1. Completing ongoing operations
+2. Saving state to disk
+3. Releasing resources (sockets, file handles)
+4. Avoiding data corruption
+
+**Contrast with Abrupt Shutdown:**
+
+| Type | Trigger | Behavior | Data Safety |
+|------|---------|----------|-------------|
+| **Graceful** | SIGTERM, SIGINT (Ctrl+C) | Complete work, save state, exit | ✅ Safe |
+| **Abrupt** | SIGKILL, power loss | Immediate termination | ❌ Risk of corruption |
+
+---
+
+### Operating System Signals
+
+**Signals** are notifications sent by the OS kernel to processes:
+
+```
+┌──────────────┐         Signal          ┌──────────────┐
+│   Kernel     │ ───────────────────────>│   Process    │
+│              │      (SIGTERM, SIGINT)  │              │
+└──────────────┘                         └──────────────┘
+```
+
+**Common Signals:**
+
+| Signal | Number | Source | Default Behavior |
+|--------|--------|--------|------------------|
+| `SIGINT` | 2 | Ctrl+C | Terminate |
+| `SIGTERM` | 15 | `kill <pid>` | Terminate |
+| `SIGKILL` | 9 | `kill -9 <pid>` | Force kill (cannot be caught) |
+| `SIGHUP` | 1 | Terminal closed | Terminate |
+| `SIGPIPE` | 13 | Write to closed pipe | Terminate |
+| `SIGSEGV` | 11 | Segmentation fault | Core dump + terminate |
+| `SIGBUS` | 7 | Bus error | Core dump + terminate |
+
+---
+
+### Redis Graceful Shutdown
+
+**Example:**
+
+```bash
+$ redis-server &
+[1] 12345
+
+$ redis-cli SET mykey "value"
+OK
+
+$ kill -SIGTERM 12345
+# or Ctrl+C
+
+# Redis output:
+# User requested shutdown...
+# Saving the final RDB snapshot before exiting.
+# DB saved on disk
+# Redis is now ready to exit, bye bye...
+```
+
+**Steps:**
+1. Receive SIGTERM/SIGINT
+2. Set shutdown flag
+3. Complete in-flight commands
+4. Save RDB snapshot (if persistence enabled)
+5. Flush AOF buffer
+6. Close client connections
+7. Exit cleanly
+
+---
+
+### Signal Handling in Redis
+
+#### Setup Signal Handlers
+
+**In `server.c` (initialization):**
+
+```c
+void setupSignalHandlers(void) {
+    struct sigaction act;
+
+    // SIGTERM handler
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = sigtermHandler;
+    sigaction(SIGTERM, &act, NULL);
+
+    // SIGINT handler (Ctrl+C)
+    act.sa_handler = sigtermHandler;
+    sigaction(SIGINT, &act, NULL);
+
+    // SIGHUP - ignore (don't terminate on terminal close)
+    signal(SIGHUP, SIG_IGN);
+
+    // SIGPIPE - ignore (don't crash on broken pipe)
+    signal(SIGPIPE, SIG_IGN);
+}
+```
+
+---
+
+#### Signal Handler Implementation
+
+```c
+static void sigtermHandler(int sig) {
+    char *msg;
+
+    switch (sig) {
+    case SIGTERM:
+        msg = "Received SIGTERM, scheduling shutdown...";
+        break;
+    case SIGINT:
+        msg = "Received SIGINT, scheduling shutdown...";
+        break;
+    default:
+        msg = "Received shutdown signal, scheduling shutdown...";
+    }
+
+    // Log message
+    serverLogFromHandler(LL_WARNING, msg);
+
+    // Set shutdown flag (read by main loop)
+    server.shutdown_asap = 1;
+}
+```
+
+**Key Point:** Handler sets flag, doesn't perform shutdown directly
+- Signal handlers run in async context
+- Cannot safely call most functions
+- Main loop checks flag and triggers shutdown
+
+---
+
+#### Main Loop Integration
+
+```c
+int main(int argc, char **argv) {
+    // ... initialization ...
+
+    aeSetBeforeSleepProc(server.el, beforeSleep);
+
+    // Main event loop
+    aeMain(server.el);
+
+    // Cleanup after event loop exits
+    aeDeleteEventLoop(server.el);
+    return 0;
+}
+
+void beforeSleep(struct aeEventLoop *eventLoop) {
+    // Check shutdown flag on every loop iteration
+    if (server.shutdown_asap) {
+        if (prepareForShutdown(SHUTDOWN_NOFLAGS) == C_OK) {
+            exit(0);
+        }
+        // If preparation failed, keep running
+        server.shutdown_asap = 0;
+    }
+
+    // ... other pre-sleep tasks ...
+}
+```
+
+---
+
+### Graceful Shutdown Implementation
+
+#### prepareForShutdown() Function
+
+```c
+int prepareForShutdown(int flags) {
+    // 1. Log shutdown
+    serverLog(LL_WARNING, "User requested shutdown...");
+
+    // 2. Kill background children (RDB/AOF rewrite)
+    if (server.aof_child_pid != -1) {
+        serverLog(LL_WARNING, "There is a child rewriting the AOF. Killing it!");
+        kill(server.aof_child_pid, SIGKILL);
+    }
+    if (server.rdb_child_pid != -1) {
+        serverLog(LL_WARNING, "There is a child saving an .rdb. Killing it!");
+        kill(server.rdb_child_pid, SIGKILL);
+    }
+
+    // 3. Flush AOF buffer
+    if (server.aof_state != AOF_OFF) {
+        flushAppendOnlyFile(1);  // Force flush
+        aof_fsync(server.aof_fd);
+    }
+
+    // 4. Save final RDB snapshot (if persistence enabled)
+    if (server.saveparamslen > 0 && !(flags & SHUTDOWN_NOSAVE)) {
+        serverLog(LL_NOTICE, "Saving the final RDB snapshot before exiting.");
+        if (rdbSave(server.rdb_filename) == C_OK) {
+            serverLog(LL_NOTICE, "DB saved on disk");
+        }
+    }
+
+    // 5. Remove PID file
+    if (server.daemonize || server.pidfile) {
+        unlink(server.pidfile);
+    }
+
+    // 6. Close listening sockets
+    closeListeningSockets(1);
+
+    serverLog(LL_WARNING, "Redis is now ready to exit, bye bye...");
+    return C_OK;
+}
+```
+
+---
+
+### Wait for Command Completion
+
+**Challenge:** Don't interrupt commands mid-execution
+
+**Solution: Engine Status State Machine**
+
+```go
+type EngineStatus int
+
+const (
+    ENGINE_WAITING      EngineStatus = 0  // Idle, waiting for events
+    ENGINE_BUSY         EngineStatus = 1  // Executing command
+    ENGINE_SHUTTING_DOWN EngineStatus = 2  // Shutdown initiated
+)
+
+var engineStatus int32 = ENGINE_WAITING  // Atomic variable
+```
+
+---
+
+#### Event Loop with Status Tracking
+
+```go
+func runAsyncTCPServer() {
+    for {
+        // Wait for events
+        events, err := epoll.Wait(-1)
+        if err != nil {
+            if engineStatus == ENGINE_SHUTTING_DOWN {
+                break  // Exit loop
+            }
+            continue
+        }
+
+        for _, event := range events {
+            // Attempt to transition to BUSY
+            if !compareAndSwap(&engineStatus, ENGINE_WAITING, ENGINE_BUSY) {
+                // Already shutting down, skip this event
+                continue
+            }
+
+            // Execute command
+            processClientCommand(event.Fd)
+
+            // Return to WAITING
+            atomic.StoreInt32(&engineStatus, ENGINE_WAITING)
+        }
+    }
+
+    serverLog("Server shutdown complete")
+}
+```
+
+---
+
+#### Signal Handler with Wait Logic
+
+```go
+func waitForSignal(wg *sync.WaitGroup, sigs chan os.Signal) {
+    defer wg.Done()
+
+    // Block until signal received
+    sig := <-sigs
+    serverLog("Received signal: %v", sig)
+
+    // Set shutdown status
+    atomic.StoreInt32(&engineStatus, ENGINE_SHUTTING_DOWN)
+
+    // Wait for current command to finish
+    for {
+        status := atomic.LoadInt32(&engineStatus)
+        if status != ENGINE_BUSY {
+            break  // No command in progress
+        }
+        time.Sleep(10 * time.Millisecond)  // Poll
+    }
+
+    // Perform shutdown tasks
+    shutdown()
+
+    os.Exit(0)
+}
+```
+
+---
+
+#### Critical Race Condition Fix
+
+**Problem:**
+
+```
+Time    Main Loop                Signal Handler
+----    ---------                --------------
+t=0     status = WAITING
+t=1                              status = SHUTTING_DOWN
+t=2     status = BUSY            ← TOO LATE!
+```
+
+Main loop might enter BUSY after shutdown initiated.
+
+**Solution: Atomic Compare-and-Swap**
+
+```go
+func compareAndSwap(addr *int32, old, new int32) bool {
+    return atomic.CompareAndSwapInt32(addr, old, new)
+}
+
+// In event loop:
+if !compareAndSwap(&engineStatus, ENGINE_WAITING, ENGINE_BUSY) {
+    // Transition failed (already shutting down)
+    continue
+}
+```
+
+**Behavior:**
+
+```
+Scenario 1: Normal transition
+- Current: WAITING
+- CAS(WAITING → BUSY): Success
+- Execute command
+
+Scenario 2: Shutdown initiated
+- Current: SHUTTING_DOWN
+- CAS(WAITING → BUSY): Fail (current ≠ WAITING)
+- Skip command, check shutdown flag
+```
+
+---
+
+### Shutdown Function
+
+```go
+func shutdown() {
+    serverLog("Starting graceful shutdown...")
+
+    // 1. Rewrite AOF
+    if config.AOFEnabled {
+        serverLog("Rewriting AOF file...")
+        if err := dumpAllAOF(); err != nil {
+            serverLog("Error rewriting AOF: %v", err)
+        }
+    }
+
+    // 2. Close listening socket
+    if listener != nil {
+        listener.Close()
+        serverLog("Listening socket closed")
+    }
+
+    // 3. Close client connections
+    for _, conn := range clients {
+        conn.Close()
+    }
+    serverLog("All client connections closed")
+
+    // 4. Flush and close AOF file
+    if aofFile != nil {
+        aofFile.Sync()
+        aofFile.Close()
+        serverLog("AOF file flushed and closed")
+    }
+
+    // 5. Clean up temporary files
+    os.Remove("temp.aof")
+
+    serverLog("Shutdown complete, goodbye!")
+}
+```
+
+---
+
+### Testing Graceful Shutdown
+
+#### Test 1: Basic Shutdown
+
+```bash
+$ go run main.go &
+[1] 12345
+Server listening on :7379
+
+$ redis-cli -p 7379 SET key1 value1
+OK
+
+$ kill -SIGTERM 12345
+# Server output:
+# Received signal: terminated
+# Starting graceful shutdown...
+# Rewriting AOF file...
+# AOF file rewrite complete
+# Listening socket closed
+# All client connections closed
+# Shutdown complete, goodbye!
+```
+
+---
+
+#### Test 2: Shutdown During Long Command
+
+**Implement test command:**
+
+```go
+func evalSLEEP(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments")
+    }
+
+    seconds, _ := strconv.Atoi(args[0])
+    time.Sleep(time.Duration(seconds) * time.Second)
+
+    return resp.EncodeSimpleString("OK")
+}
+```
+
+**Test:**
+
+```bash
+$ go run main.go &
+
+$ redis-cli -p 7379 SLEEP 10 &
+# Sleeping for 10 seconds...
+
+$ kill -SIGTERM <pid>
+# Server output:
+# Received signal: terminated
+# Waiting for command to complete...
+# (after 10 seconds)
+# Starting graceful shutdown...
+# Shutdown complete, goodbye!
+```
+
+**Verification:** Shutdown waits for SLEEP to finish ✅
+
+---
+
+### Error Signal Handling
+
+For crashes (SIGSEGV, SIGBUS, etc.), Redis logs diagnostic info:
+
+```c
+void setupSignalHandlers(void) {
+    // ... SIGTERM/SIGINT handlers ...
+
+    // Crash handlers
+    act.sa_flags = SA_NODEFER | SA_RESETHAND | SA_SIGINFO;
+    act.sa_sigaction = sigsegvHandler;
+    sigaction(SIGSEGV, &act, NULL);
+    sigaction(SIGBUS, &act, NULL);
+    sigaction(SIGFPE, &act, NULL);
+    sigaction(SIGILL, &act, NULL);
+}
+
+void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
+    serverLog(LL_WARNING, "===== REDIS BUG REPORT START =====");
+    serverLog(LL_WARNING, "    Redis %s crashed by signal: %d", REDIS_VERSION, sig);
+
+    // Stack trace
+    logStackTrace(secret);
+
+    // Client info
+    logCurrentClient();
+
+    // Memory info
+    logMemoryInfo();
+
+    serverLog(LL_WARNING, "===== REDIS BUG REPORT END =====");
+
+    // Re-raise signal to trigger core dump
+    raise(sig);
+}
+```
+
+---
+
+### Summary
+
+**Graceful Shutdown Flow:**
+1. ✅ Receive signal (SIGTERM/SIGINT)
+2. ✅ Set shutdown flag
+3. ✅ Wait for in-flight commands
+4. ✅ Save persistence data (RDB/AOF)
+5. ✅ Close sockets and connections
+6. ✅ Clean up resources
+7. ✅ Exit
+
+**Implementation Highlights:**
+1. ✅ **Signal handlers**: Set flag, don't execute logic directly
+2. ✅ **Engine status**: State machine (WAITING/BUSY/SHUTTING_DOWN)
+3. ✅ **Atomic CAS**: Prevent race between command start and shutdown
+4. ✅ **Wait loop**: Poll until BUSY → WAITING
+5. ✅ **Shutdown function**: Persistence, cleanup, exit
+
+**Go Implementation:**
+
+```go
+// Main function
+func main() {
+    var wg sync.WaitGroup
+
+    // Goroutine 1: TCP server
+    go runAsyncTCPServer()
+
+    // Goroutine 2: Signal handler
+    wg.Add(1)
+    sigs := make(chan os.Signal, 1)
+    signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+    go waitForSignal(&wg, sigs)
+
+    wg.Wait()  // Wait for signal handler to complete
+}
+```
+
+**Key Principles:**
+- **Data safety**: Never corrupt persistence files
+- **Client courtesy**: Finish commands before disconnect
+- **Resource cleanup**: Release sockets, file handles
+- **Crash resilience**: Log diagnostic info for debugging
+
+**Next:** Transactions and MULTI/EXEC implementation
+
+---
