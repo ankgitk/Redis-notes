@@ -31,6 +31,7 @@
    - [Chapter 37: Lua Scripting - Programmability](#chapter-37-lua-scripting-and-programmability)
    - [Chapter 38: Geospatial - Location-Based Queries](#chapter-38-geospatial-commands---location-based-queries)
    - [Chapter 39: Performance and Best Practices](#chapter-39-performance-considerations-and-best-practices)
+   - [Chapter 40: Probabilistic Data Structures at Scale](#chapter-40-probabilistic-data-structures-at-scale)
 
 ---
 
