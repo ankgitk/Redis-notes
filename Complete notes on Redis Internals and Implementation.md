@@ -8655,3 +8655,1302 @@ EXEC
 **Next:** Internal data structures (ziplist, quicklist, intset)
 
 ---
+# Part 6: Internal Data Structures
+
+## Chapter 22: List Internals - Ziplist and Quicklist
+
+### Redis List Implementation
+
+Redis lists support operations like `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, and `LRANGE`. The internal implementation has evolved over time for optimal performance and memory efficiency.
+
+**Current Encoding (Redis 7.0+):**
+```bash
+127.0.0.1:6379> LPUSH mylist "element1"
+(integer) 1
+127.0.0.1:6379> DEBUG OBJECT mylist
+Value at:0x7f8a... encoding:quicklist serializedlength:20 lru:12345678
+```
+
+**Encoding:** `quicklist` (hybrid structure)
+
+---
+
+### Why Not Standard Doubly Linked List?
+
+**Traditional Doubly Linked List:**
+
+```c
+struct ListNode {
+    struct ListNode *prev;  // 8 bytes (64-bit)
+    struct ListNode *next;  // 8 bytes
+    void *value;            // 8 bytes
+};
+// Total: 24 bytes per node
+```
+
+**Problems:**
+
+#### 1. Memory Overhead
+
+```
+For a 5-character string ("hello"):
+- String data: 5 bytes
+- Node overhead: 24 bytes
+- redisObject: 16 bytes
+- Total: 45 bytes (89% overhead!)
+```
+
+**For 1 million small strings:**
+```
+Data: 5MB
+Overhead: 40MB
+Total: 45MB (800% waste)
+```
+
+---
+
+#### 2. Cache Inefficiency
+
+**Memory Layout:**
+
+```
+Node 1 @ 0x1000 ──> prev: 0x5000
+                    next: 0x3000
+                    value: "hello"
+
+Node 2 @ 0x3000 ──> prev: 0x1000
+                    next: 0x7000
+                    value: "world"
+
+Node 3 @ 0x7000 ──> prev: 0x3000
+                    next: NULL
+                    value: "redis"
+```
+
+**Traversal Pattern:**
+- Jump from 0x1000 → 0x3000 (12KB gap)
+- Jump from 0x3000 → 0x7000 (16KB gap)
+- **CPU cache misses** on every access
+
+---
+
+### Solution 1: Ziplist
+
+**Ziplist** is a memory-efficient, contiguous data structure that stores elements sequentially in a single memory block.
+
+#### Memory Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Total Bytes │ Tail Offset │ Num Elements │ Entries... │ END │
+│   (4 bytes) │  (4 bytes)  │  (2 bytes)   │            │ 0xFF│
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Example:**
+
+```
+Ziplist containing ["hello", "world", "redis"]:
+
+┌────┬────┬────┬─────────────────────────────────────────────┬────┐
+│ 50 │ 35 │ 3  │ Entry1 │ Entry2 │ Entry3                   │0xFF│
+└────┴────┴────┴─────────────────────────────────────────────┴────┘
+  │    │    │
+  │    │    └─ Number of elements (3)
+  │    └────── Offset to last entry (35 bytes)
+  └─────────── Total size (50 bytes)
+```
+
+---
+
+#### Entry Structure
+
+Each entry contains:
+1. **Previous Entry Length**: Variable (1 or 5 bytes)
+2. **Encoding**: Variable (describes data type)
+3. **Data**: Actual content
+
+**Entry Layout:**
+
+```
+┌──────────────────┬──────────┬────────────┐
+│ Prev Entry Len   │ Encoding │ Data       │
+│ (1 or 5 bytes)   │ (varies) │ (varies)   │
+└──────────────────┴──────────┴────────────┘
+```
+
+---
+
+#### Previous Entry Length Encoding
+
+**Optimization for small lengths:**
+
+```c
+if (prev_len <= 253) {
+    // Store in 1 byte
+    *p = prev_len;
+} else {
+    // Store 0xFE + 4 bytes
+    *p = 0xFE;
+    *(uint32_t*)(p+1) = prev_len;
+}
+```
+
+**Example:**
+
+```
+Entry after 10-byte entry:
+┌────┬──────┬──────────┐
+│ 10 │ enc  │ "hello"  │
+└────┴──────┴──────────┘
+  │
+  └─ Previous entry was 10 bytes (fits in 1 byte)
+
+Entry after 300-byte entry:
+┌────┬────┬────┬────┬────┬────┬──────┬──────────┐
+│0xFE│0x2C│0x01│0x00│0x00│enc │ data │          │
+└────┴────┴────┴────┴────┴────┴──────┴──────────┘
+  │    └──────────┬─────────┘
+  │               └─ 300 (0x012C) in 4 bytes
+  └─ Flag indicating 4-byte length follows
+```
+
+---
+
+#### Encoding Field
+
+**First 2 bits determine type:**
+
+| Bits | Type | Description |
+|------|------|-------------|
+| `00` | String | Length ≤ 63 bytes (6 bits for length) |
+| `01` | String | Length ≤ 16,383 bytes (14 bits for length) |
+| `10` | String | Length > 16,383 bytes (32 bits for length) |
+| `11` | Integer | Next 2 bits specify integer size |
+
+**String Encoding:**
+
+```
+Type 00 (small string):
+┌──┬──────┐
+│00│LLLLLL│ + data
+└──┴──────┘
+   └─ 6-bit length (max 63)
+
+Type 01 (medium string):
+┌──┬──────┬────────┐
+│01│LLLLLL│LLLLLLLL│ + data
+└──┴──────┴────────┘
+   └────┬────────┘
+        └─ 14-bit length (max 16,383)
+
+Type 10 (large string):
+┌──┬──────┬────┬────┬────┬────┐
+│10│000000│LL  │LL  │LL  │LL  │ + data
+└──┴──────┴────┴────┴────┴────┘
+           └────────┬─────────┘
+                    └─ 32-bit length
+```
+
+**Integer Encoding:**
+
+```
+Type 11 (integer):
+┌──┬──┬────────┐
+│11│XX│ data   │
+└──┴──┴────────┘
+    │
+    └─ 00: 16-bit int
+       01: 32-bit int
+       10: 64-bit int
+       11: 24-bit or 8-bit int
+```
+
+---
+
+#### Complete Example
+
+**Ziplist with 3 elements: ["redis", 42, "world"]**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Total: 45 │ Tail: 32 │ Count: 3 │                               │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 1: "redis"                                               │
+│ ┌────┬────────┬─────┬─────┬─────┬─────┬─────┐                 │
+│ │ 0  │00000101│ 'r' │ 'e' │ 'd' │ 'i' │ 's' │                 │
+│ └────┴────────┴─────┴─────┴─────┴─────┴─────┘                 │
+│   │      │                                                      │
+│   │      └─ String, length 5                                   │
+│   └─ No previous entry                                         │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 2: 42                                                    │
+│ ┌────┬────────┬────┬────┐                                      │
+│ │ 7  │11000000│0x2A│0x00│                                      │
+│ └────┴────────┴────┴────┘                                      │
+│   │      │                                                      │
+│   │      └─ 16-bit integer                                     │
+│   └─ Previous entry: 7 bytes                                   │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 3: "world"                                               │
+│ ┌────┬────────┬─────┬─────┬─────┬─────┬─────┐                 │
+│ │ 4  │00000101│ 'w' │ 'o' │ 'r' │ 'l' │ 'd' │                 │
+│ └────┴────────┴─────┴─────┴─────┬─────┴─────┘                 │
+│   │      │                       ▲                              │
+│   │      └─ String, length 5     │                              │
+│   └─ Previous entry: 4 bytes     └─ Tail offset points here    │
+├────────────────────────────────────────────────────────────────┤
+│ End: 0xFF                                                      │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Ziplist Operations
+
+**Push (tail):**
+
+```c
+unsigned char *ziplistPush(unsigned char *zl, unsigned char *s, unsigned int slen, int where) {
+    // Calculate new size
+    size_t curlen = intrev32ifbe(ZIPLIST_BYTES(zl));
+    size_t reqlen = /* encoded size of new entry */;
+
+    // Realloc ziplist
+    zl = ziplistResize(zl, curlen + reqlen);
+
+    // Insert entry at tail
+    // Update tail offset
+    // Update count
+
+    return zl;
+}
+```
+
+**Pop (head/tail):**
+
+```c
+unsigned char *ziplistPop(unsigned char *zl, int where) {
+    // Read entry at position
+    // Calculate entry size
+    // memmove to remove entry
+    // Realloc to shrink
+    // Update metadata
+
+    return zl;
+}
+```
+
+**Find:**
+
+```c
+unsigned char *ziplistFind(unsigned char *p, unsigned char *vstr, unsigned int vlen) {
+    while (p[0] != ZIP_END) {
+        // Decode entry
+        // Compare with target
+        if (match) return p;
+
+        // Skip to next entry
+        p += entry_size;
+    }
+    return NULL;
+}
+```
+
+---
+
+#### Ziplist Advantages
+
+1. ✅ **Sequential memory**: Cache-friendly traversal
+2. ✅ **No pointers**: Zero per-element overhead
+3. ✅ **O(1) head/tail access**: Via tail offset
+4. ✅ **Memory efficient**: Compact encoding
+
+**Memory Comparison:**
+
+```
+Linked List (3 elements):
+- Nodes: 3 × 24 = 72 bytes
+- Data: 15 bytes
+- Total: 87 bytes
+
+Ziplist (3 elements):
+- Header: 10 bytes
+- Entries: ~25 bytes (with encoding)
+- Total: 35 bytes
+
+Savings: 60%
+```
+
+---
+
+#### Ziplist Disadvantages
+
+1. ❌ **Insert/Delete middle**: O(N) - requires memmove
+2. ❌ **Reallocation**: Growth requires new allocation + copy
+3. ❌ **Cascade updates**: Changing entry size may cascade
+
+**Cascade Update Problem:**
+
+```
+Before:
+Entry1 (252 bytes) | Entry2 (prev_len: 252, 1 byte) | Entry3...
+
+After inserting 2 bytes in Entry1:
+Entry1 (254 bytes) | Entry2 (prev_len: 254, 5 bytes!) | Entry3 (prev_len changed!)...
+                                   └─ Needs 0xFE prefix
+
+Result: Chain reaction of updates
+```
+
+---
+
+### Solution 2: Quicklist
+
+**Quicklist** = Doubly linked list of ziplists
+
+#### Structure
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      Quicklist                           │
+├──────────────────────────────────────────────────────────┤
+│  head ──┐                                      tail ──┐  │
+│         │                                             │  │
+│         ▼                                             ▼  │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  │ Quicklist    │ ───> │ Quicklist    │ ───> │ Quicklist    │
+│  │ Node 1       │ <─── │ Node 2       │ <─── │ Node 3       │
+│  ├──────────────┤      ├──────────────┤      ├──────────────┤
+│  │ *prev = NULL │      │ *prev        │      │ *prev        │
+│  │ *next ────────────> │ *next ────────────> │ *next = NULL │
+│  │ *ziplist     │      │ *ziplist     │      │ *ziplist     │
+│  └──────┬───────┘      └──────┬───────┘      └──────┬───────┘
+│         │                     │                     │
+│         ▼                     ▼                     ▼
+│  ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│  │  Ziplist 1  │       │  Ziplist 2  │       │  Ziplist 3  │
+│  │  [a,b,c,d]  │       │  [e,f,g,h]  │       │  [i,j,k,l]  │
+│  └─────────────┘       └─────────────┘       └─────────────┘
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Quicklist Node
+
+```c
+typedef struct quicklistNode {
+    struct quicklistNode *prev;
+    struct quicklistNode *next;
+    unsigned char *zl;           // Pointer to ziplist
+    unsigned int sz;             // Ziplist size in bytes
+    unsigned int count : 16;     // Number of items in ziplist
+    unsigned int encoding : 2;   // RAW=1 or LZF=2 (compressed)
+    unsigned int container : 2;  // ZIPLIST=2
+    unsigned int recompress : 1; // Was compressed?
+    unsigned int attempted_compress : 1;
+    unsigned int extra : 10;     // Reserved
+} quicklistNode;
+```
+
+---
+
+#### Configuration
+
+```bash
+# redis.conf
+list-max-ziplist-size -2
+
+# Meaning of negative values:
+# -1: max 4KB per ziplist
+# -2: max 8KB per ziplist (default)
+# -3: max 16KB per ziplist
+# -4: max 32KB per ziplist
+# -5: max 64KB per ziplist
+
+# Positive values = max entries per ziplist
+list-max-ziplist-size 512
+```
+
+---
+
+#### Quicklist Operations
+
+**Push:**
+
+```c
+void quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
+    quicklistNode *node = quicklist->head;
+
+    if (node && ziplistCanFit(node->zl, sz)) {
+        // Add to existing ziplist
+        node->zl = ziplistPush(node->zl, value, sz, ZIPLIST_HEAD);
+        node->count++;
+    } else {
+        // Create new node
+        quicklistNode *new_node = quicklistCreateNode();
+        new_node->zl = ziplistNew();
+        new_node->zl = ziplistPush(new_node->zl, value, sz, ZIPLIST_HEAD);
+        _quicklistInsertNodeBefore(quicklist, node, new_node);
+    }
+}
+```
+
+**Split:**
+
+```c
+void quicklistSplitNode(quicklistNode *node) {
+    // If ziplist too large, split in half
+    size_t sz = ziplistBlobLen(node->zl);
+
+    if (sz < list_max_ziplist_size) return;
+
+    // Create new node
+    quicklistNode *new_node = quicklistCreateNode();
+
+    // Split ziplist at midpoint
+    unsigned char *zl2 = ziplistSplit(node->zl, /* midpoint */);
+    new_node->zl = zl2;
+
+    // Insert new node after current
+    _quicklistInsertNodeAfter(quicklist, node, new_node);
+}
+```
+
+---
+
+#### Performance Characteristics
+
+| Operation | Ziplist | Quicklist |
+|-----------|---------|-----------|
+| **LPUSH/RPUSH** | O(1)* | O(1) |
+| **LPOP/RPOP** | O(1)* | O(1) |
+| **LINDEX (middle)** | O(N) | O(N) |
+| **LINSERT (middle)** | O(N) | O(N) |
+| **Memory** | Excellent | Very Good |
+| **Cache locality** | Excellent | Good (per-ziplist) |
+
+*Amortized O(1), may require reallocation
+
+---
+
+### Comparison Summary
+
+**Doubly Linked List:**
+- ❌ 24 bytes overhead per element
+- ❌ Poor cache locality
+- ✅ O(1) insert/delete anywhere
+- ✅ No reallocation
+
+**Ziplist:**
+- ✅ 1-5 bytes overhead per element
+- ✅ Excellent cache locality
+- ❌ O(N) insert/delete middle
+- ❌ Cascade updates possible
+- ❌ Best for small lists (<512 elements)
+
+**Quicklist:**
+- ✅ ~2-3 bytes overhead per element
+- ✅ Good cache locality (per ziplist)
+- ✅ Dynamic sizing
+- ✅ Best of both worlds
+- ✅ Production default
+
+**Memory Usage (1000 elements):**
+
+```
+Doubly Linked List: ~40KB
+Ziplist: ~15KB (if fits)
+Quicklist (10 ziplists): ~17KB
+
+Savings: 57%
+```
+
+---
+
+## Chapter 23: Set Internals - Intset
+
+### Redis Set Implementation
+
+Redis sets store unique elements with fast membership testing.
+
+```bash
+127.0.0.1:6379> SADD myset 1 2 3 4 5
+(integer) 5
+127.0.0.1:6379> DEBUG OBJECT myset
+Value at:0x7f8a... encoding:intset serializedlength:50
+```
+
+**Encoding:** `intset` (for integer-only sets)
+
+---
+
+### Set Encoding Strategies
+
+Redis dynamically chooses encoding based on contents:
+
+#### 1. Intset Encoding
+
+**Used when:** All members are integers
+
+```bash
+127.0.0.1:6379> SADD numbers 10 20 30
+(integer) 3
+127.0.0.1:6379> OBJECT ENCODING numbers
+"intset"
+```
+
+---
+
+#### 2. Hash Table Encoding
+
+**Used when:** Contains non-integers or too many integers
+
+```bash
+127.0.0.1:6379> SADD mixed 10 "hello" 30
+(integer) 3
+127.0.0.1:6379> OBJECT ENCODING mixed
+"hashtable"
+```
+
+---
+
+### Intset Structure
+
+**Intset** is a sorted array of integers stored in a single contiguous memory block.
+
+#### Memory Layout
+
+```c
+typedef struct intset {
+    uint32_t encoding;  // 4 bytes: INT16, INT32, or INT64
+    uint32_t length;    // 4 bytes: number of elements
+    int8_t contents[];  // Variable: actual integers
+} intset;
+```
+
+**Example:**
+
+```
+Intset with [10, 20, 30] (16-bit encoding):
+
+┌──────────┬──────────┬────┬────┬────┬────┬────┬────┐
+│ encoding │ length   │ 10 │ 00 │ 20 │ 00 │ 30 │ 00 │
+│  (INT16) │   (3)    │    │    │    │    │    │    │
+└──────────┴──────────┴────┴────┴────┴────┴────┴────┘
+  4 bytes    4 bytes     2 bytes  2 bytes  2 bytes
+
+Total: 8 + 6 = 14 bytes
+```
+
+---
+
+#### Encoding Types
+
+```c
+#define INTSET_ENC_INT16 (sizeof(int16_t))  // 2 bytes
+#define INTSET_ENC_INT32 (sizeof(int32_t))  // 4 bytes
+#define INTSET_ENC_INT64 (sizeof(int64_t))  // 8 bytes
+```
+
+**Selection:**
+
+```
+Value Range              Encoding
+-----------              --------
+-32,768 to 32,767       → INT16
+-2^31 to 2^31-1         → INT32
+-2^63 to 2^63-1         → INT64
+```
+
+---
+
+### Intset Operations
+
+#### 1. Creation
+
+```c
+intset *intsetNew(void) {
+    intset *is = zmalloc(sizeof(intset));
+    is->encoding = intrev32ifbe(INTSET_ENC_INT16);  // Start with smallest
+    is->length = 0;
+    return is;
+}
+```
+
+---
+
+#### 2. Adding Elements
+
+**Algorithm:**
+
+```
+1. Check if value fits current encoding
+2. If not, upgrade encoding
+3. Binary search for insert position
+4. If value exists, return (sets are unique)
+5. If new, shift elements and insert
+```
+
+**Implementation:**
+
+```c
+intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+
+    *success = 1;
+
+    // Upgrade if necessary
+    if (valenc > intrev32ifbe(is->encoding)) {
+        return intsetUpgradeAndAdd(is, value);
+    }
+
+    // Binary search
+    if (intsetSearch(is, value, &pos)) {
+        *success = 0;  // Already exists
+        return is;
+    }
+
+    // Resize
+    is = intsetResize(is, intrev32ifbe(is->length) + 1);
+
+    // Shift elements
+    if (pos < intrev32ifbe(is->length)) {
+        intsetMoveTail(is, pos, pos + 1);
+    }
+
+    // Insert
+    _intsetSet(is, pos, value);
+    is->length = intrev32ifbe(intrev32ifbe(is->length) + 1);
+
+    return is;
+}
+```
+
+---
+
+#### 3. Upgrading Encoding
+
+**When adding 40000 to INT16 intset:**
+
+```
+Before (INT16):
+┌──────┬────┬────┬────┬────┬────┬────┐
+│ enc  │len │ 10 │ 00 │ 20 │ 00 │ 30 │ 00 │
+│INT16 │ 3  │        │        │        │
+└──────┴────┴────┴────┴────┴────┴────┴────┘
+
+After (INT32) - 40000 added:
+┌──────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ enc  │len │ 10 │ 00 │ 00 │ 00 │ 20 │ 00 │ 00 │ 00 │ 30 │ 00 │ 00 │ 00 │9C40│ 00 │ 00 │ 00 │
+│INT32 │ 4  │          10            │          20            │          30            │40000│
+└──────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+```
+
+**Upgrade Implementation:**
+
+```c
+static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
+    uint8_t curenc = intrev32ifbe(is->encoding);
+    uint8_t newenc = _intsetValueEncoding(value);
+    int length = intrev32ifbe(is->length);
+
+    // Determine prepend (value < all) or append (value > all)
+    int prepend = value < 0 ? 1 : 0;
+
+    // Update encoding
+    is->encoding = intrev32ifbe(newenc);
+
+    // Resize for new encoding
+    is = intsetResize(is, length + 1);
+
+    // Move existing elements (from back to avoid overwrites)
+    while (length--) {
+        _intsetSet(is, length + prepend, _intsetGetEncoded(is, length, curenc));
+    }
+
+    // Insert new value at prepend (0) or end (length+1)
+    if (prepend) {
+        _intsetSet(is, 0, value);
+    } else {
+        _intsetSet(is, intrev32ifbe(is->length), value);
+    }
+
+    is->length = intrev32ifbe(intrev32ifbe(is->length) + 1);
+    return is;
+}
+```
+
+---
+
+#### 4. Binary Search
+
+```c
+static uint8_t intsetSearch(intset *is, int64_t value, uint32_t *pos) {
+    int min = 0, max = intrev32ifbe(is->length) - 1, mid = -1;
+    int64_t cur = -1;
+
+    // Empty set
+    if (intrev32ifbe(is->length) == 0) {
+        if (pos) *pos = 0;
+        return 0;
+    }
+
+    // Value out of range
+    if (value > _intsetGet(is, max)) {
+        if (pos) *pos = intrev32ifbe(is->length);
+        return 0;
+    } else if (value < _intsetGet(is, 0)) {
+        if (pos) *pos = 0;
+        return 0;
+    }
+
+    // Binary search
+    while (max >= min) {
+        mid = ((unsigned)min + (unsigned)max) >> 1;
+        cur = _intsetGet(is, mid);
+
+        if (value > cur) {
+            min = mid + 1;
+        } else if (value < cur) {
+            max = mid - 1;
+        } else {
+            break;  // Found
+        }
+    }
+
+    if (value == cur) {
+        if (pos) *pos = mid;
+        return 1;  // Found
+    } else {
+        if (pos) *pos = min;
+        return 0;  // Not found
+    }
+}
+```
+
+---
+
+#### 5. Removing Elements
+
+```c
+intset *intsetRemove(intset *is, int64_t value, int *success) {
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+
+    *success = 0;
+
+    // Check if value could be in intset
+    if (valenc <= intrev32ifbe(is->encoding) && intsetSearch(is, value, &pos)) {
+        uint32_t len = intrev32ifbe(is->length);
+        *success = 1;
+
+        // Shift elements left
+        if (pos < (len - 1)) {
+            intsetMoveTail(is, pos + 1, pos);
+        }
+
+        // Resize
+        is = intsetResize(is, len - 1);
+        is->length = intrev32ifbe(len - 1);
+    }
+
+    return is;
+}
+```
+
+---
+
+### Configuration Threshold
+
+```bash
+# redis.conf
+set-max-intset-entries 512
+
+# If elements > 512, convert to hashtable
+```
+
+**Example:**
+
+```bash
+127.0.0.1:6379> CONFIG GET set-max-intset-entries
+1) "set-max-intset-entries"
+2) "512"
+
+127.0.0.1:6379> SADD bigset <513 integers>
+127.0.0.1:6379> OBJECT ENCODING bigset
+"hashtable"  # Converted
+```
+
+---
+
+### Performance Analysis
+
+**Time Complexity:**
+
+| Operation | Intset | Hashtable |
+|-----------|--------|-----------|
+| **SADD** | O(N) | O(1) |
+| **SREM** | O(N) | O(1) |
+| **SISMEMBER** | O(log N) | O(1) |
+| **SINTER** | O(N·M) | O(N·M) |
+| **Memory** | Excellent | Good |
+
+**Why O(log N) for SISMEMBER?**
+- Binary search on sorted array
+- Much faster than O(N) linear scan
+- Acceptable for small sets (<512 elements)
+
+---
+
+**Space Comparison:**
+
+```
+Hashtable (512 integers):
+- Buckets: 512 × 16 = 8KB
+- Overhead: ~4KB
+- Total: ~12KB
+
+Intset (512 int32):
+- Header: 8 bytes
+- Data: 512 × 4 = 2048 bytes
+- Total: ~2KB
+
+Savings: 83%
+```
+
+---
+
+### When Intset is Used
+
+**Conditions:**
+1. ✅ All members are integers
+2. ✅ Count ≤ `set-max-intset-entries` (default 512)
+
+**Conversion to Hashtable:**
+- Adding non-integer member
+- Exceeding entry limit
+
+**Example:**
+
+```bash
+127.0.0.1:6379> SADD numbers 1 2 3
+127.0.0.1:6379> OBJECT ENCODING numbers
+"intset"
+
+127.0.0.1:6379> SADD numbers "hello"
+127.0.0.1:6379> OBJECT ENCODING numbers
+"hashtable"  # Permanent conversion
+```
+
+---
+
+## Chapter 24: Geospatial Queries and Geohash
+
+### Redis Geospatial Support
+
+Redis provides commands for storing and querying geographic coordinates.
+
+**Commands:**
+- `GEOADD`: Add locations
+- `GEODIST`: Distance between points
+- `GEORADIUS`: Find locations within radius
+- `GEOSEARCH`: Advanced proximity search
+
+---
+
+### Basic Usage
+
+```bash
+# Add locations
+127.0.0.1:6379> GEOADD cities 13.361389 38.115556 "Palermo"
+(integer) 1
+127.0.0.1:6379> GEOADD cities 15.087269 37.502669 "Catania"
+(integer) 1
+
+# Find distance
+127.0.0.1:6379> GEODIST cities Palermo Catania km
+"166.2742"
+
+# Find nearby (within 100km of Palermo)
+127.0.0.1:6379> GEORADIUS cities 13.361389 38.115556 100 km
+1) "Palermo"
+```
+
+---
+
+### The Challenge
+
+**Naive Approach:**
+
+```
+For each query:
+  For each location:
+    distance = sqrt((x2-x1)² + (y2-y1)²)
+    if distance <= radius:
+      add to results
+
+Complexity: O(N) per query
+```
+
+**Problem:** N-dimensional distance calculations are expensive
+- Square root computation
+- Floating-point arithmetic
+- No index possible
+
+---
+
+### GeoHash Algorithm
+
+**GeoHash** encodes 2D coordinates (lat, lon) into a single integer, enabling fast proximity searches.
+
+#### Core Concept
+
+**Divide and Conquer:**
+
+```
+1. Split world in half
+2. Assign bit based on which half
+3. Repeat recursively
+4. Concatenate bits
+```
+
+---
+
+#### Step-by-Step Example
+
+**Goal:** Encode location (Longitude: 13.361, Latitude: 38.115)
+
+**Step 1: Longitude (-180 to 180)**
+
+```
+Iteration 1: [-180, 180]
+  Midpoint: 0
+  13.361 > 0 → Right half → Bit: 1
+  Range: [0, 180]
+
+Iteration 2: [0, 180]
+  Midpoint: 90
+  13.361 < 90 → Left half → Bit: 0
+  Range: [0, 90]
+
+Iteration 3: [0, 90]
+  Midpoint: 45
+  13.361 < 45 → Left half → Bit: 0
+  Range: [0, 45]
+
+Continue for 26 iterations...
+Final: 01001010110001... (26 bits)
+```
+
+**Step 2: Latitude (-90 to 90)**
+
+```
+Iteration 1: [-90, 90]
+  Midpoint: 0
+  38.115 > 0 → Right half → Bit: 1
+  Range: [0, 90]
+
+Iteration 2: [0, 90]
+  Midpoint: 45
+  38.115 < 45 → Left half → Bit: 0
+  Range: [0, 45]
+
+Continue for 26 iterations...
+Final: 10011101001110... (26 bits)
+```
+
+---
+
+#### Interleaving Bits
+
+**Why interleave?**
+
+Concatenation would only allow zooming in one dimension:
+```
+Concat: [lat bits][lon bits]
+Removing bits from right only affects longitude
+```
+
+**Interleaving solution:**
+```
+Odd bits  = Longitude
+Even bits = Latitude
+
+Interleaved: 1 0 1 0 0 1 0 1 1 0 0 1 ...
+             │ │ │ │ │ │ │ │ │ │ │ │
+             │ └─│─└─│─└─│─└─│─└─│─└─ Latitude
+             └───┴───┴───┴───┴───┴─── Longitude
+```
+
+---
+
+#### Efficient Interleaving
+
+**Naive approach: Loop (O(N))**
+
+```c
+uint64_t interleave_naive(uint32_t x, uint32_t y) {
+    uint64_t result = 0;
+    for (int i = 0; i < 32; i++) {
+        result |= ((uint64_t)(x & (1 << i)) << i);
+        result |= ((uint64_t)(y & (1 << i)) << (i + 1));
+    }
+    return result;
+}
+```
+
+---
+
+**Optimized: Bit manipulation (O(1))**
+
+```c
+uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
+    static const uint64_t B[] = {
+        0x5555555555555555ULL,
+        0x3333333333333333ULL,
+        0x0F0F0F0F0F0F0F0FULL,
+        0x00FF00FF00FF00FFULL,
+        0x0000FFFF0000FFFFULL
+    };
+    static const unsigned S[] = {1, 2, 4, 8, 16};
+
+    uint64_t x = xlo;
+    uint64_t y = ylo;
+
+    x = (x | (x << S[4])) & B[4];
+    y = (y | (y << S[4])) & B[4];
+
+    x = (x | (x << S[3])) & B[3];
+    y = (y | (y << S[3])) & B[3];
+
+    x = (x | (x << S[2])) & B[2];
+    y = (y | (y << S[2])) & B[2];
+
+    x = (x | (x << S[1])) & B[1];
+    y = (y | (y << S[1])) & B[1];
+
+    x = (x | (x << S[0])) & B[0];
+    y = (y | (y << S[0])) & B[0];
+
+    return x | (y << 1);
+}
+```
+
+**Magic numbers:**
+- `0x5555...` = `0101010101...` (odd bits)
+- `0x3333...` = `0011001100...` (pairs)
+- `0x0F0F...` = `0000111100...` (nibbles)
+
+---
+
+### Computing GeoHash
+
+**Redis Implementation:**
+
+```c
+void geohashEncode(const GeoHashRange *lat_range,
+                   const GeoHashRange *lon_range,
+                   double latitude, double longitude,
+                   uint8_t step, GeoHashBits *hash) {
+    // Calculate relative offsets (0 to 1)
+    double lat_offset =
+        (latitude - lat_range->min) / (lat_range->max - lat_range->min);
+    double lon_offset =
+        (longitude - lon_range->min) / (lon_range->max - lon_range->min);
+
+    // Scale to integer (26-bit precision)
+    lat_offset *= (1ULL << step);
+    lon_offset *= (1ULL << step);
+
+    // Interleave
+    hash->bits = interleave64((uint32_t)lat_offset, (uint32_t)lon_offset);
+    hash->step = step * 2;  // 26 bits each = 52 bits total
+}
+```
+
+---
+
+### Proximity via Prefix Matching
+
+**Key Insight:** Locations with same GeoHash prefix are nearby
+
+```
+Location A: 11010110... (GeoHash)
+Location B: 11010101... (Same 5-bit prefix)
+Location C: 10110010... (Different prefix)
+
+A and B are closer than A and C
+```
+
+**Zoom Levels:**
+
+```
+52 bits: ~0.6m precision
+50 bits: ~2.4m precision
+48 bits: ~9.6m precision
+...
+26 bits: ~10m precision
+20 bits: ~600m precision
+```
+
+---
+
+### Finding Neighbors
+
+**Algorithm:**
+
+```
+1. Calculate GeoHash of query point
+2. Determine search radius in bits
+3. Generate neighbor GeoHashes
+4. Search for points with matching prefixes
+```
+
+**Neighbor GeoHashes:**
+
+```
+Current: 110101...
+
+Neighbors (move 1 grid cell):
+North:     110111...
+South:     110001...
+East:      110110...
+West:      110100...
+NorthEast: 110111...
+...
+```
+
+---
+
+### Redis Internal Storage
+
+**Sorted Set Encoding:**
+
+```bash
+127.0.0.1:6379> GEOADD locations 13.361 38.115 "Palermo"
+127.0.0.1:6379> TYPE locations
+zset
+
+127.0.0.1:6379> ZSCORE locations Palermo
+"3479099956230698"
+         └─ This is the GeoHash!
+```
+
+**Under the hood:**
+
+```c
+void geoaddCommand(client *c) {
+    // For each location:
+    double lat = /* parse latitude */;
+    double lon = /* parse longitude */;
+
+    // Encode as GeoHash
+    GeoHashBits hash;
+    geohashEncode(&lat_range, &lon_range, lat, lon, 26, &hash);
+
+    // Store in sorted set (score = GeoHash)
+    zsetAdd(key, hash.bits, member);
+}
+```
+
+---
+
+### GEORADIUS Implementation
+
+**High-level algorithm:**
+
+```c
+void georadiusGeneric(client *c, int flags) {
+    // 1. Compute GeoHash of center point
+    GeoHashBits hash;
+    geohashEncode(/* center lat/lon */);
+
+    // 2. Get GeoHash ranges for radius
+    GeoHashRadius radius_area = geohashGetAreasByRadius(lat, lon, radius_m);
+
+    // 3. For each range, query sorted set
+    for (int i = 0; i < 9; i++) {  // 9 neighbor cells
+        GeoHashBits min = radius_area.hash[i].min;
+        GeoHashBits max = radius_area.hash[i].max;
+
+        // ZRANGEBYSCORE on GeoHash range
+        membersInRange(zset, min.bits, max.bits);
+    }
+
+    // 4. Filter by exact distance
+    for (each candidate) {
+        double distance = geohashGetDistance(center, candidate);
+        if (distance <= radius) {
+            addReply(candidate);
+        }
+    }
+}
+```
+
+---
+
+### Performance Analysis
+
+**Naive Distance Calculation:**
+```
+For 1M locations:
+- Time per query: O(N) = 1M distance calculations
+- With 1000 queries/sec: 1B calculations/sec
+```
+
+**GeoHash Approach:**
+```
+For 1M locations:
+- GeoHash lookup: O(log N) = ~20 comparisons
+- Neighbor cells: 9 × O(log N) = ~180 comparisons
+- Exact distance: O(K) where K = candidates (~100)
+- Total: ~300 operations
+
+Speedup: 3,333× faster
+```
+
+---
+
+### Precision vs Performance
+
+**Bits vs Accuracy:**
+
+| Bits | Grid Size | Use Case |
+|------|-----------|----------|
+| 52 | 0.6m | Indoor navigation |
+| 48 | 9.6m | Building-level |
+| 40 | 153m | City block |
+| 32 | 2.4km | Neighborhood |
+| 26 | 10m | Redis default |
+
+**Trade-off:**
+- More bits = Higher precision, more memory
+- Fewer bits = Coarser grid, less memory
+
+---
+
+### Summary
+
+**GeoHash Algorithm:**
+1. ✅ Encode (lat, lon) as single integer
+2. ✅ Recursive binary division
+3. ✅ Bit interleaving for 2D zooming
+4. ✅ Prefix matching for proximity
+
+**Implementation:**
+1. ✅ 26-bit precision per dimension (52 bits total)
+2. ✅ Stored as sorted set scores
+3. ✅ Neighbor cell generation
+4. ✅ Two-phase filter (GeoHash + exact distance)
+
+**Performance:**
+- **GEOADD**: O(log N)
+- **GEORADIUS**: O(log N + K) where K = results
+- **Memory**: 8 bytes per location (vs 16 bytes for lat+lon)
+
+**Next:** String internals with Simple Dynamic Strings (SDS)
+
+---
