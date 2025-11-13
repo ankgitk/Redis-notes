@@ -3842,3 +3842,1520 @@ INFO memory
 
 ---
 
+# Part 5: Advanced Features
+
+## Chapter 12: Command Pipelining
+
+### What is Pipelining?
+
+**Command Pipelining** is a Redis optimization technique that allows clients to send multiple commands in a single network request, significantly reducing round-trip time (RTT) overhead and improving throughput.
+
+**Key Characteristics:**
+- Multiple commands sent together
+- Multiple responses returned together
+- Commands execute independently (NOT a transaction)
+- No atomicity guarantees across pipelined commands
+
+### Why Pipelining Matters
+
+#### The RTT Problem
+
+**Traditional Request-Response Model:**
+
+```
+Client                          Server
+  |                               |
+  |--- SET key1 value1 --------->|
+  |                               | (compute)
+  |<---------- +OK ---------------|
+  |                               |
+  |--- SET key2 value2 --------->|
+  |                               | (compute)
+  |<---------- +OK ---------------|
+  |                               |
+  |--- GET key1 --------------->|
+  |                               | (compute)
+  |<-------- "value1" ------------|
+
+Total time = 3 × RTT + 3 × computation_time
+```
+
+**With Pipelining:**
+
+```
+Client                          Server
+  |                               |
+  |--- SET key1 value1 --------->|
+  |--- SET key2 value2 --------->|
+  |--- GET key1 --------------->|
+  |                               | (compute all)
+  |<---------- +OK ---------------|
+  |<---------- +OK ---------------|
+  |<-------- "value1" ------------|
+
+Total time = 1 × RTT + 3 × computation_time
+```
+
+**Performance Impact:**
+- **Localhost**: RTT ≈ 0.1ms (minimal benefit)
+- **Same datacenter**: RTT ≈ 1-5ms (moderate benefit)
+- **Cross-region**: RTT ≈ 50-200ms (massive benefit)
+
+#### Throughput Improvement
+
+Without pipelining, if each command takes 1ms RTT:
+- **Throughput**: 1,000 commands/second
+
+With pipelining (batch of 100 commands):
+- **Throughput**: 100,000 commands/second (100× improvement)
+
+---
+
+### How Pipelining Works
+
+#### RESP Protocol for Multiple Commands
+
+Commands are concatenated as a single byte stream using RESP encoding:
+
+**Individual Commands:**
+```
+PING      → *1\r\n$4\r\nPING\r\n
+SET k v   → *3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n
+GET k     → *2\r\n$3\r\nGET\r\n$1\r\nk\r\n
+```
+
+**Pipelined Request (concatenated):**
+```
+*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n
+```
+
+**Pipelined Response (concatenated):**
+```
++PONG\r\n+OK\r\n$1\r\nv\r\n
+```
+
+---
+
+### Implementation
+
+#### Architecture Changes
+
+**Before (Single Command):**
+```
+readCommand()  → returns 1 command
+eval()         → processes 1 command
+respond()      → writes 1 response directly to socket
+```
+
+**After (Pipelining):**
+```
+readCommands() → returns []commands (slice of commands)
+eval()         → processes each command, buffers responses
+respond()      → writes all buffered responses in one socket write
+```
+
+#### 1. Reading Multiple Commands
+
+**Old: `readCommand` (single command):**
+```go
+func readCommand(conn net.Conn) (*redisCommand, error) {
+    data := make([]byte, 4096)
+    n, err := conn.Read(data)
+    if err != nil {
+        return nil, err
+    }
+
+    cmd := decode(data[:n])  // Returns single command
+    return cmd, nil
+}
+```
+
+**New: `readCommands` (multiple commands):**
+```go
+func readCommands(conn net.Conn) ([]*redisCommand, error) {
+    data := make([]byte, 4096)
+    n, err := conn.Read(data)
+    if err != nil {
+        return nil, err
+    }
+
+    cmds := decodeMultiple(data[:n])  // Returns slice of commands
+    return cmds, nil
+}
+```
+
+#### 2. Decoding Multiple Commands
+
+**Modified `decode` function:**
+```go
+// decodeMultiple processes concatenated RESP commands
+func decodeMultiple(data []byte) []*redisCommand {
+    var commands []*redisCommand
+    offset := 0
+
+    for offset < len(data) {
+        // Decode one command at a time
+        cmd, bytesRead := decodeOne(data[offset:])
+        if cmd == nil {
+            break  // No more complete commands
+        }
+
+        commands = append(commands, cmd)
+        offset += bytesRead  // Advance to next command
+    }
+
+    return commands
+}
+
+// decodeOne decodes a single RESP array and returns bytes consumed
+func decodeOne(data []byte) (*redisCommand, int) {
+    if len(data) == 0 || data[0] != '*' {
+        return nil, 0
+    }
+
+    // Parse array length
+    i := 1
+    for data[i] != '\r' {
+        i++
+    }
+    arrayLen, _ := strconv.Atoi(string(data[1:i]))
+    i += 2  // Skip \r\n
+
+    startOffset := 0
+    cmd := &redisCommand{
+        Args: make([]string, arrayLen),
+    }
+
+    // Parse each bulk string element
+    for idx := 0; idx < arrayLen; idx++ {
+        // Skip '$'
+        i++
+
+        // Read bulk string length
+        lenStart := i
+        for data[i] != '\r' {
+            i++
+        }
+        strLen, _ := strconv.Atoi(string(data[lenStart:i]))
+        i += 2  // Skip \r\n
+
+        // Read bulk string content
+        cmd.Args[idx] = string(data[i : i+strLen])
+        i += strLen + 2  // Skip content + \r\n
+    }
+
+    bytesRead := i - startOffset
+    return cmd, bytesRead
+}
+```
+
+#### 3. Buffered Response Writing
+
+**Old: Direct Write:**
+```go
+func evalAndRespond(cmd *redisCommand, conn net.Conn) {
+    switch strings.ToUpper(cmd.Args[0]) {
+    case "PING":
+        conn.Write([]byte("+PONG\r\n"))  // Direct write
+    case "SET":
+        // ... process SET
+        conn.Write([]byte("+OK\r\n"))    // Direct write
+    }
+}
+```
+
+**New: Buffered Write:**
+```go
+func evalAndRespond(cmds []*redisCommand, conn net.Conn) {
+    var buffer bytes.Buffer  // In-memory buffer
+
+    for _, cmd := range cmds {
+        // Evaluate command and get response bytes
+        response := evaluateCommand(cmd)
+        buffer.Write(response)  // Append to buffer
+    }
+
+    // Single write to socket with all responses
+    conn.Write(buffer.Bytes())
+}
+
+func evaluateCommand(cmd *redisCommand) []byte {
+    switch strings.ToUpper(cmd.Args[0]) {
+    case "PING":
+        return []byte("+PONG\r\n")
+    case "SET":
+        key, value := cmd.Args[1], cmd.Args[2]
+        store[key] = value
+        return []byte("+OK\r\n")
+    case "GET":
+        key := cmd.Args[1]
+        if val, exists := store[key]; exists {
+            return resp.EncodeBulkString(val)
+        }
+        return resp.EncodeNullBulkString()
+    default:
+        return resp.EncodeError("ERR unknown command")
+    }
+}
+```
+
+---
+
+### Performance Benefits
+
+#### Reduced Context Switches
+
+**Without Pipelining (3 commands):**
+```
+1. Read from socket      (syscall, context switch)
+2. Process command 1     (CPU)
+3. Write to socket       (syscall, context switch)
+4. Read from socket      (syscall, context switch)
+5. Process command 2     (CPU)
+6. Write to socket       (syscall, context switch)
+7. Read from socket      (syscall, context switch)
+8. Process command 3     (CPU)
+9. Write to socket       (syscall, context switch)
+
+Total: 6 context switches
+```
+
+**With Pipelining (3 commands):**
+```
+1. Read from socket      (syscall, context switch)
+2. Process command 1     (CPU)
+3. Process command 2     (CPU)
+4. Process command 3     (CPU)
+5. Write to socket       (syscall, context switch)
+
+Total: 2 context switches
+```
+
+**Efficiency Gain:**
+- **3× fewer syscalls**
+- **3× fewer context switches**
+- Continuous CPU execution (better cache locality)
+
+#### Memory Trade-off
+
+**Server-side Buffering Cost:**
+
+For a pipeline with N commands:
+```
+Memory = N × avg_response_size
+```
+
+**Example:**
+- 100 commands pipelined
+- Average response size: 50 bytes
+- **Buffer memory**: 100 × 50 = 5KB
+
+**Practical Limit:**
+- Redis handles pipelines of 10,000+ commands
+- But large pipelines consume server memory
+- Recommended: 100-1,000 commands per pipeline
+
+---
+
+### Testing Pipelining
+
+**Using `netcat` and `printf`:**
+
+```bash
+# Build pipelined request
+printf "*1\r\n\$4\r\nPING\r\n*3\r\n\$3\r\nSET\r\n\$1\r\nk\r\n\$1\r\nv\r\n*2\r\n\$3\r\nGET\r\n\$1\r\nk\r\n" | nc localhost 6379
+```
+
+**Expected output:**
+```
++PONG
++OK
+$1
+v
+```
+
+**Using Redis CLI with `--pipe`:**
+
+```bash
+# Create commands file
+cat > commands.txt << EOF
+SET key1 value1
+SET key2 value2
+GET key1
+GET key2
+EOF
+
+# Pipe to Redis
+cat commands.txt | redis-cli --pipe
+```
+
+**Benchmark with `redis-benchmark`:**
+
+```bash
+# Without pipelining
+redis-benchmark -t set,get -n 100000 -q
+# SET: 45000 requests per second
+# GET: 48000 requests per second
+
+# With pipelining (16 commands per pipeline)
+redis-benchmark -t set,get -n 100000 -P 16 -q
+# SET: 580000 requests per second (13× faster)
+# GET: 620000 requests per second (13× faster)
+```
+
+---
+
+### Key Differences: Pipelining vs Transactions
+
+| Aspect | Pipelining | Transactions (MULTI/EXEC) |
+|--------|-----------|--------------------------|
+| **Atomicity** | ❌ No | ✅ Yes (all-or-nothing) |
+| **Isolation** | ❌ No | ✅ Yes (no interleaving) |
+| **Command Order** | ✅ Sequential | ✅ Sequential |
+| **Error Handling** | Each command independent | Entire transaction fails |
+| **Performance** | High throughput | Moderate (additional overhead) |
+| **Use Case** | Bulk operations | Consistent state updates |
+
+**Example showing independence:**
+
+```bash
+# Pipeline
+SET counter 10
+INCR counter
+INCR invalid_type  # This fails
+INCR counter
+
+# Results:
+# +OK
+# :11
+# -ERR wrong type
+# :12   ← Counter still incremented despite previous error
+```
+
+---
+
+### Summary
+
+**What Pipelining Provides:**
+1. ✅ **Reduced RTT**: Send multiple commands in one network request
+2. ✅ **Higher Throughput**: 10-100× improvement for batch operations
+3. ✅ **Fewer Context Switches**: Less syscall overhead
+4. ✅ **Better CPU Utilization**: Continuous processing
+
+**Implementation Changes:**
+1. ✅ `readCommands()`: Decode multiple concatenated RESP commands
+2. ✅ `decodeOne()`: Parse single command, return bytes consumed
+3. ✅ `evaluateCommand()`: Return response bytes instead of direct write
+4. ✅ Buffered response: Accumulate all responses before single write
+
+**Trade-offs:**
+- ⚠️ Server memory consumption (buffering responses)
+- ⚠️ No atomicity (commands execute independently)
+- ⚠️ Client complexity (batch management)
+
+**When to Use:**
+- ✅ Bulk inserts
+- ✅ Batch reads
+- ✅ High-latency networks
+- ❌ Avoid for operations requiring immediate feedback
+
+**Next:** AOF persistence for durability
+
+---
+
+## Chapter 13: AOF Persistence (Append-Only File)
+
+### What is Persistence in Redis?
+
+Redis is often described as an **in-memory database**, but it offers multiple **persistence mechanisms** to flush data to disk, preventing data loss on crashes or restarts.
+
+**Two Persistence Modes:**
+1. **RDB (Redis Database)**: Point-in-time snapshots
+2. **AOF (Append-Only File)**: Command logging (this chapter)
+
+### RDB vs AOF: A Comparison
+
+#### RDB (Snapshot-based)
+
+**What it does:**
+- Creates a complete dump of the entire dataset at a specific point in time
+- Stored as a single binary file (e.g., `dump.rdb`)
+
+**How it works:**
+```
+┌─────────────────────┐
+│   Redis Memory      │
+│  ┌──────────────┐   │      BGSAVE         ┌──────────────┐
+│  │ key1: value1 │   │  ================>  │  dump.rdb    │
+│  │ key2: value2 │   │   (fork process)    │  (binary)    │
+│  │ key3: value3 │   │                     └──────────────┘
+│  └──────────────┘   │
+└─────────────────────┘
+```
+
+**Mechanism (BGSAVE):**
+```go
+func BGSAVE() {
+    // Fork a child process
+    pid := fork()
+
+    if pid == 0 {  // Child process
+        // Child has copy-on-write access to parent's memory
+        rdbFile := createRDBFile("dump.rdb")
+
+        // Iterate entire dataset
+        for key, value := range store {
+            rdbFile.Write(encodeRDB(key, value))
+        }
+
+        rdbFile.Close()
+        os.Exit(0)
+    }
+
+    // Parent continues serving requests
+    return "+Background saving started\r\n"
+}
+```
+
+**Pros:**
+- ✅ **Compact**: Single binary file, highly compressed
+- ✅ **Fast recovery**: Loading RDB is faster than replaying commands
+- ✅ **Portable**: Easy to copy to S3, backup services
+
+**Cons:**
+- ❌ **Data loss**: Crash between snapshots loses all intermediate writes
+- ❌ **CPU/Disk intensive**: Full dump is expensive for large datasets
+- ❌ **Infrequent**: Typically run every 5-60 minutes
+
+**Data Loss Example:**
+```
+Time    Event                    RDB State
+----    -----                    ---------
+00:00   BGSAVE triggered         ✓ dump.rdb (0 keys)
+00:01   SET key1 val1
+00:02   SET key2 val2
+00:03   SET key3 val3
+00:04   ⚠️ CRASH                  ✗ Lost 3 keys (last dump was at 00:00)
+```
+
+---
+
+#### AOF (Command Logging)
+
+**What it does:**
+- Logs every **write command** to a file
+- Appends commands to `appendonly.aof`
+- Skips read-only commands (GET, SCAN, etc.)
+
+**How it works:**
+```
+Client Commands              AOF File (appendonly.aof)
+---------------              -------------------------
+SET key1 val1      ──────>   *3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$4\r\nval1\r\n
+SET key2 val2      ──────>   *3\r\n$3\r\nSET\r\n$4\r\nkey2\r\n$4\r\nval2\r\n
+INCR counter       ──────>   *3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$1\r\n5\r\n
+DEL key1           ──────>   *2\r\n$3\r\nDEL\r\n$4\r\nkey1\r\n
+```
+
+**Pros:**
+- ✅ **High durability**: Minimal data loss (configurable: 1 second)
+- ✅ **Append-only**: Simple, sequential writes (fast)
+- ✅ **Human-readable**: RESP format, can inspect/edit manually
+
+**Cons:**
+- ❌ **Large file size**: Logs all operations, not just final state
+- ❌ **Slow recovery**: Must replay all commands on restart
+- ❌ **Redundancy**: Multiple updates to same key create bloat
+
+---
+
+### AOF File Format
+
+AOF files store commands in **RESP (REdis Serialization Protocol)** format:
+
+**Example Commands:**
+```bash
+SET name Alice
+SET age 30
+INCR age
+DEL name
+```
+
+**Resulting AOF file:**
+```
+*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nAlice\r\n
+*3\r\n$3\r\nSET\r\n$3\r\nage\r\n$2\r\n30\r\n
+*3\r\n$3\r\nSET\r\n$3\r\nage\r\n$2\r\n31\r\n
+*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n
+```
+
+**Why RESP format?**
+1. **Simple replay**: Feed file contents directly to command parser
+2. **Debuggable**: Can read/edit with text editor
+3. **Portable**: Standard Redis protocol
+
+---
+
+### Command Normalization
+
+Redis **normalizes** complex commands to simpler equivalents before logging:
+
+**Example: INCR command**
+
+```bash
+# Client executes
+INCR counter
+
+# If counter was 4, after INCR it becomes 5
+# AOF logs the SET command (normalized form):
+SET counter 5
+```
+
+**Why normalize?**
+- **Idempotency**: Replaying `SET counter 5` always gives same result
+- **Simplicity**: Don't need special replay logic for INCR
+- **Correctness**: Avoids issues with concurrent modifications
+
+**Other normalization examples:**
+
+| Original Command | Logged to AOF |
+|-----------------|---------------|
+| `INCR counter` | `SET counter 6` |
+| `APPEND msg " world"` | `SET msg "hello world"` |
+| `SETEX key 10 val` | `SET key val` + `EXPIREAT key 1234567890` |
+
+---
+
+### AOF Rewriting (BGREWRITEAOF)
+
+#### The Bloat Problem
+
+**Scenario:**
+```bash
+SET user:1:name "Alice"
+SET user:1:name "Bob"
+SET user:1:name "Charlie"
+SET user:1:name "David"
+```
+
+**AOF file contains:**
+```
+*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$5\r\nAlice\r\n
+*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$3\r\nBob\r\n
+*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$7\r\nCharlie\r\n
+*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$5\r\nDavid\r\n
+```
+
+**But final state only needs:**
+```
+*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$5\r\nDavid\r\n
+```
+
+**File size: 300 bytes → 75 bytes (75% reduction)**
+
+---
+
+#### BGREWRITEAOF Implementation
+
+**Process:**
+
+```
+┌────────────────────────────────────────────────┐
+│ Step 1: Trigger BGREWRITEAOF                   │
+│ ────────────────────────────────────────────── │
+│ Client sends command or auto-trigger by config │
+└────────────────────────────────────────────────┘
+                      ↓
+┌────────────────────────────────────────────────┐
+│ Step 2: Iterate Current Dataset                │
+│ ────────────────────────────────────────────── │
+│ for key, value := range store {                │
+│     writeToTempAOF("SET", key, value)          │
+│ }                                              │
+└────────────────────────────────────────────────┘
+                      ↓
+┌────────────────────────────────────────────────┐
+│ Step 3: Write to Temporary File                │
+│ ────────────────────────────────────────────── │
+│ temp file: appendonly.aof.tmp                  │
+│ Contains minimal commands for current state    │
+└────────────────────────────────────────────────┘
+                      ↓
+┌────────────────────────────────────────────────┐
+│ Step 4: Atomic Rename                          │
+│ ────────────────────────────────────────────── │
+│ os.Rename("appendonly.aof.tmp",                │
+│           "appendonly.aof")                    │
+└────────────────────────────────────────────────┘
+```
+
+**Go Implementation:**
+
+```go
+// evalBGREWRITEAOF handles the BGREWRITEAOF command
+func evalBGREWRITEAOF(args []string) []byte {
+    // TODO: Should fork() for async execution
+    // For now, synchronous implementation
+
+    err := dumpAllAOF()
+    if err != nil {
+        return resp.EncodeError("ERR " + err.Error())
+    }
+
+    return resp.EncodeSimpleString("Background AOF rewrite started")
+}
+
+// dumpAllAOF rewrites the entire AOF file
+func dumpAllAOF() error {
+    log.Println("Rewriting AOF file at", config.AOFPath)
+
+    // Open temp file for writing
+    tempPath := config.AOFPath + ".tmp"
+    file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    // Iterate over all keys in memory
+    for key, obj := range store {
+        // Skip expired keys
+        if obj.ExpiresAt > 0 && time.Now().UnixMilli() >= obj.ExpiresAt {
+            continue
+        }
+
+        // Construct SET command
+        cmd := []string{"SET", key, obj.Value.(string)}
+
+        // Encode as RESP array
+        respCmd := encodeRESPArray(cmd)
+
+        // Write to file
+        _, err := file.Write(respCmd)
+        if err != nil {
+            return err
+        }
+
+        // If key has expiration, write EXPIREAT
+        if obj.ExpiresAt > 0 {
+            expireCmd := []string{
+                "EXPIREAT",
+                key,
+                strconv.FormatInt(obj.ExpiresAt/1000, 10),
+            }
+            file.Write(encodeRESPArray(expireCmd))
+        }
+    }
+
+    // Atomic rename
+    err = os.Rename(tempPath, config.AOFPath)
+    if err != nil {
+        return err
+    }
+
+    log.Println("AOF file rewrite complete")
+    return nil
+}
+
+// encodeRESPArray converts ["SET", "key", "value"] to RESP format
+func encodeRESPArray(args []string) []byte {
+    var buf bytes.Buffer
+
+    // Array header: *3\r\n
+    buf.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
+
+    // Each element as bulk string
+    for _, arg := range args {
+        buf.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
+    }
+
+    return buf.Bytes()
+}
+```
+
+**Example Execution:**
+
+```bash
+# Connect to Redis
+$ redis-cli
+
+# Perform multiple operations
+127.0.0.1:6379> SET k1 v1
+OK
+127.0.0.1:6379> SET k2 v2
+OK
+127.0.0.1:6379> SET k3 v4
+OK
+127.0.0.1:6379> SET k3 v3
+OK
+
+# Trigger rewrite
+127.0.0.1:6379> BGREWRITEAOF
+Background AOF rewrite started
+
+# Server logs:
+# Rewriting AOF file at ./appendonly.aof
+# AOF file rewrite complete
+
+# Check file contents
+$ cat appendonly.aof
+*3
+$3
+SET
+$2
+k1
+$2
+v1
+*3
+$3
+SET
+$2
+k2
+$2
+v2
+*3
+$3
+SET
+$2
+k3
+$2
+v3
+```
+
+**Notice:** Only 3 SET commands (not 4) — the duplicate `k3` was optimized.
+
+---
+
+### AOF Validation and Repair
+
+Redis provides `redis-check-aof` utility to validate and fix corrupted AOF files.
+
+**Check file integrity:**
+```bash
+$ redis-check-aof appendonly.aof
+AOF analyzed
+Status: OK
+```
+
+**Fix corrupted file:**
+```bash
+# Corrupt the file (e.g., incomplete write during crash)
+$ echo "garbage data" >> appendonly.aof
+
+# Check again
+$ redis-check-aof appendonly.aof
+AOF analyzed
+Status: NOT OK
+...
+
+# Repair (removes invalid commands)
+$ redis-check-aof --fix appendonly.aof
+AOF analyzed
+Truncated 15 bytes from file
+Status: OK (repaired)
+```
+
+---
+
+### Durability Guarantees
+
+AOF supports three **fsync policies** controlling when data is flushed from OS buffer to disk:
+
+| Policy | Description | Durability | Performance |
+|--------|-------------|-----------|-------------|
+| **always** | fsync after every write | Highest (0 loss) | Slowest |
+| **everysec** | fsync once per second | High (≤1s loss) | Fast |
+| **no** | OS decides when to fsync | Low (minutes loss) | Fastest |
+
+**Configuration:**
+```bash
+# redis.conf
+appendfsync everysec
+```
+
+**Trade-off Example (1M writes/sec):**
+
+- **always**: 500-1000 writes/sec (fsync bottleneck)
+- **everysec**: 50,000+ writes/sec (good balance)
+- **no**: 100,000+ writes/sec (risky)
+
+---
+
+### Loading AOF on Startup
+
+**Startup Sequence:**
+
+```go
+func loadAOF(path string) error {
+    file, err := os.Open(path)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    log.Println("Loading AOF file:", path)
+
+    scanner := bufio.NewScanner(file)
+    var commandBuffer []byte
+
+    for scanner.Scan() {
+        commandBuffer = append(commandBuffer, scanner.Bytes()...)
+        commandBuffer = append(commandBuffer, '\n')
+
+        // Try to decode complete command
+        cmd, bytesRead := decodeOne(commandBuffer)
+        if cmd != nil {
+            // Execute command
+            evaluateCommand(cmd)
+
+            // Remove processed bytes
+            commandBuffer = commandBuffer[bytesRead:]
+        }
+    }
+
+    log.Println("AOF loaded successfully")
+    return nil
+}
+```
+
+**Startup Flow:**
+```
+1. Server starts
+2. Check if appendonly.aof exists
+3. If exists:
+   a. Read file line by line
+   b. Decode RESP commands
+   c. Execute commands in memory
+4. Server ready to accept connections
+```
+
+---
+
+### Summary
+
+**RDB vs AOF Comparison:**
+
+| Feature | RDB | AOF |
+|---------|-----|-----|
+| **File Size** | Small (binary) | Large (text commands) |
+| **Recovery Speed** | Fast | Slow (replay commands) |
+| **Data Loss** | Minutes | Seconds |
+| **CPU Impact** | High (during fork) | Low (append-only) |
+| **Debuggability** | Opaque binary | Human-readable |
+
+**When to Use Each:**
+
+- **RDB only**: Acceptable to lose minutes of data, need fast restarts
+- **AOF only**: Need high durability, can tolerate slower restarts
+- **Both**: Maximum durability + fast recovery (load RDB, replay AOF since snapshot)
+
+**What We Implemented:**
+1. ✅ `BGREWRITEAOF` command
+2. ✅ Iterate dataset, write minimal SET commands
+3. ✅ RESP encoding for AOF format
+4. ✅ Atomic file replacement
+5. ✅ Command normalization (INCR → SET)
+
+**Production Enhancements (TODO):**
+- ⏳ Async forking (non-blocking BGREWRITEAOF)
+- ⏳ Incremental AOF (log commands as they arrive)
+- ⏳ Auto-rewrite triggers (size/percentage thresholds)
+- ⏳ Mixed persistence (RDB + AOF)
+
+**Next:** Object encodings and the INCR command
+
+---
+
+## Chapter 14: Objects, Encodings, and INCR Command
+
+### The Redis Object Model
+
+Redis stores all values as **`redisObject`** instances, a generic structure that wraps all data types with metadata for efficient memory management and flexible encoding.
+
+#### Why a Generic Object Model?
+
+**Problem:** Different data structures need different metadata:
+- Strings need length tracking
+- Lists need element count
+- Sets need cardinality estimation
+- All need expiration tracking
+- All need memory management
+
+**Solution:** Single unified structure (`redisObject`) with:
+- Type abstraction
+- Encoding polymorphism
+- Reference counting
+- LRU tracking
+
+---
+
+### The redisObject Structure
+
+**C Structure (Redis source):**
+```c
+typedef struct redisObject {
+    unsigned type:4;        // 4 bits: object type
+    unsigned encoding:4;    // 4 bits: encoding/implementation
+    unsigned lru:24;        // 24 bits: LRU time or LFU data
+    int refcount;           // 4 bytes: reference count
+    void *ptr;              // 8 bytes: pointer to actual data
+} robj;
+```
+
+**Memory Layout:**
+```
+┌─────────────────────────────────────────────┐
+│ Byte 0: [type:4][encoding:4]               │  1 byte
+│ Bytes 1-3: [lru:24]                        │  3 bytes
+│ Bytes 4-7: [refcount:32]                   │  4 bytes
+│ Bytes 8-15: [ptr:64]                       │  8 bytes
+├─────────────────────────────────────────────┤
+│ TOTAL SIZE: 16 bytes (on 64-bit systems)   │
+└─────────────────────────────────────────────┘
+```
+
+**Note:** Original struct is 12 bytes in Redis (32-bit ptr), but modern 64-bit systems use 16 bytes.
+
+---
+
+### Bitfields Optimization
+
+#### What are Bitfields?
+
+**Bitfields** (C/C++ feature) allow allocating specific numbers of bits to struct members, saving memory:
+
+```c
+struct Example {
+    unsigned type:4;      // Only 4 bits (values 0-15)
+    unsigned encoding:4;  // Only 4 bits (values 0-15)
+    unsigned lru:24;      // 24 bits (values 0-16,777,215)
+};
+```
+
+**Memory Savings:**
+
+| Without Bitfields | With Bitfields |
+|------------------|----------------|
+| `unsigned type` (4 bytes) | `type:4` (4 bits) |
+| `unsigned encoding` (4 bytes) | `encoding:4` (4 bits) |
+| `unsigned lru` (4 bytes) | `lru:24` (24 bits) |
+| **Total: 12 bytes** | **Total: 4 bytes** |
+
+**Savings: 67% memory reduction (8 bytes saved per object)**
+
+For 1 million objects: **8 MB saved**
+
+---
+
+### Go Implementation (No Native Bitfields)
+
+Go doesn't support bitfields, so we combine `type` and `encoding` into a single `uint8`:
+
+```go
+type Object struct {
+    typeEncoding uint8       // Combined: [type:4][encoding:4]
+    lru          uint32      // 24 bits used (stored as 32-bit for alignment)
+    refcount     int32       // Reference count
+    value        interface{} // Pointer to actual data
+    expiresAt    int64       // Expiration timestamp (ms)
+}
+
+// Extract type (upper 4 bits)
+func (o *Object) Type() ObjectType {
+    return ObjectType(o.typeEncoding >> 4)
+}
+
+// Extract encoding (lower 4 bits)
+func (o *Object) Encoding() ObjectEncoding {
+    return ObjectEncoding(o.typeEncoding & 0x0F)
+}
+
+// Set type and encoding
+func (o *Object) SetTypeEncoding(objType ObjectType, encoding ObjectEncoding) {
+    o.typeEncoding = (uint8(objType) << 4) | uint8(encoding)
+}
+```
+
+**Bitwise Operations Explained:**
+
+```
+typeEncoding = 0b0011_0010
+               └┬─┘ └┬─┘
+                │    └─ encoding = 2 (lower 4 bits)
+                └────── type = 3 (upper 4 bits)
+
+// Extract type
+type = typeEncoding >> 4
+     = 0b0011_0010 >> 4
+     = 0b0000_0011
+     = 3
+
+// Extract encoding
+encoding = typeEncoding & 0x0F
+         = 0b0011_0010 & 0b0000_1111
+         = 0b0000_0010
+         = 2
+
+// Set typeEncoding
+typeEncoding = (type << 4) | encoding
+             = (3 << 4) | 2
+             = 0b0011_0000 | 0b0000_0010
+             = 0b0011_0010
+```
+
+---
+
+### Object Types
+
+Redis supports a **limited set** of abstract types (4 bits = max 16 types):
+
+```go
+type ObjectType uint8
+
+const (
+    OBJ_STRING ObjectType = iota  // 0
+    OBJ_LIST                      // 1
+    OBJ_SET                       // 2
+    OBJ_ZSET                      // 3 (sorted set)
+    OBJ_HASH                      // 4
+    OBJ_MODULE                    // 5 (custom modules)
+    // 6-15 reserved for future types
+)
+```
+
+**Key Insight:** Integers are **NOT** a distinct type in Redis. They're stored as `OBJ_STRING` with `OBJ_ENCODING_INT`.
+
+---
+
+### Object Encodings
+
+Each type can have **multiple implementations** (encodings), optimized for different scenarios:
+
+```go
+type ObjectEncoding uint8
+
+const (
+    OBJ_ENCODING_RAW      ObjectEncoding = iota  // 0: Raw bytes
+    OBJ_ENCODING_INT                             // 1: Integer
+    OBJ_ENCODING_HT                              // 2: Hash table
+    OBJ_ENCODING_ZIPLIST                         // 3: Ziplist
+    OBJ_ENCODING_INTSET                          // 4: Integer set
+    OBJ_ENCODING_SKIPLIST                        // 5: Skip list
+    OBJ_ENCODING_EMBSTR                          // 6: Embedded string
+    OBJ_ENCODING_QUICKLIST                       // 7: Quicklist
+    OBJ_ENCODING_LISTPACK                        // 8: Listpack
+)
+```
+
+#### Encodings by Type
+
+**OBJ_STRING:**
+- `OBJ_ENCODING_RAW`: General strings, binary data
+- `OBJ_ENCODING_INT`: Strings representing integers
+- `OBJ_ENCODING_EMBSTR`: Small strings (≤44 bytes)
+
+**OBJ_LIST:**
+- `OBJ_ENCODING_ZIPLIST`: Small lists (<512 elements)
+- `OBJ_ENCODING_LINKEDLIST`: Large lists
+- `OBJ_ENCODING_QUICKLIST`: Hybrid (default in modern Redis)
+
+**OBJ_SET:**
+- `OBJ_ENCODING_INTSET`: All elements are small integers
+- `OBJ_ENCODING_HT`: General sets (hash table)
+
+**OBJ_ZSET:**
+- `OBJ_ENCODING_ZIPLIST`: Small sorted sets
+- `OBJ_ENCODING_SKIPLIST`: Large sorted sets
+
+**OBJ_HASH:**
+- `OBJ_ENCODING_ZIPLIST`: Small hashes
+- `OBJ_ENCODING_HT`: Large hashes
+
+---
+
+### Dynamic Encoding Conversion
+
+Redis **automatically converts** encodings when thresholds are crossed:
+
+**Example: List Encoding Transition**
+
+```
+Small list (< 512 elements):
+OBJ_LIST + OBJ_ENCODING_ZIPLIST
+  ↓ (insert 513th element)
+Large list (>= 512 elements):
+OBJ_LIST + OBJ_ENCODING_LINKEDLIST
+```
+
+**Why?**
+- **Ziplist**: Memory-efficient, slower access
+- **Linked list**: Memory-intensive, faster access
+- **Trade-off**: Use ziplist until performance degrades
+
+**Threshold Configuration:**
+```bash
+# redis.conf
+list-max-ziplist-entries 512
+list-max-ziplist-value 64
+```
+
+---
+
+### String Encodings Deep Dive
+
+#### OBJ_ENCODING_INT
+
+**Used when:** String value is a valid 64-bit signed integer
+
+```go
+func deduceTypeEncoding(value string) (ObjectType, ObjectEncoding) {
+    // Try to parse as integer
+    if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+        return OBJ_STRING, OBJ_ENCODING_INT
+    }
+
+    // Otherwise, check length
+    if len(value) <= 44 {
+        return OBJ_STRING, OBJ_ENCODING_EMBSTR
+    }
+
+    return OBJ_STRING, OBJ_ENCODING_RAW
+}
+```
+
+**Example:**
+```bash
+SET counter "42"
+# Stored as: type=OBJ_STRING, encoding=OBJ_ENCODING_INT
+# value pointer stores "42" (can be optimized to store int64 directly)
+```
+
+---
+
+#### OBJ_ENCODING_EMBSTR
+
+**Used when:** String length ≤ 44 bytes
+
+**Why 44 bytes?**
+
+```
+Redis object overhead:
+  - typeEncoding: 1 byte
+  - lru:          3 bytes
+  - refcount:     4 bytes
+  - ptr:          8 bytes
+  - TOTAL:        16 bytes
+
+Typical allocation size: 64 bytes
+
+Available for string:
+  64 bytes (allocation)
+  - 16 bytes (redisObject)
+  - 3 bytes (SDS header for length/capacity)
+  - 1 byte (null terminator)
+  = 44 bytes
+```
+
+**Memory Layout:**
+
+```
+┌────────────────────────────────────────────┐
+│ redisObject (16 bytes)                     │
+├────────────────────────────────────────────┤
+│ SDS Header (3 bytes)                       │
+├────────────────────────────────────────────┤
+│ String Data (up to 44 bytes)               │
+├────────────────────────────────────────────┤
+│ Null Terminator (1 byte)                   │
+└────────────────────────────────────────────┘
+  Total: 64 bytes (fits in single allocation)
+```
+
+**Benefits:**
+- ✅ Single malloc (not two: object + string)
+- ✅ Better cache locality
+- ✅ Reduced memory fragmentation
+
+---
+
+#### OBJ_ENCODING_RAW
+
+**Used when:** String length > 44 bytes OR binary data
+
+**Memory Layout:**
+
+```
+┌────────────────────┐
+│ redisObject        │
+│   ptr ────────┐    │
+└───────────────│────┘
+                │
+                ↓
+        ┌──────────────────┐
+        │ SDS Structure    │
+        │ - len            │
+        │ - capacity       │
+        │ - data[]         │
+        └──────────────────┘
+```
+
+**Example:**
+```bash
+SET longkey "This is a very long string that exceeds 44 bytes..."
+# Stored as: type=OBJ_STRING, encoding=OBJ_ENCODING_RAW
+# ptr points to separate SDS allocation
+```
+
+---
+
+### INCR Command Implementation
+
+#### Behavior Specification
+
+```bash
+# Key doesn't exist → initialize to 0, then increment
+INCR counter
+# Result: 1
+
+# Key exists with integer-encoded string
+SET counter "5"
+INCR counter
+# Result: 6
+
+# Key exists with non-integer string
+SET counter "hello"
+INCR counter
+# Error: "ERR value is not an integer or out of range"
+```
+
+---
+
+#### Implementation
+
+```go
+func evalINCR(args []string) []byte {
+    if len(args) != 1 {
+        return resp.EncodeError("ERR wrong number of arguments for 'INCR' command")
+    }
+
+    key := args[0]
+
+    // Get existing object or create new one
+    obj, exists := store[key]
+
+    var currentValue int64
+
+    if !exists {
+        // Key doesn't exist → initialize to 0
+        currentValue = 0
+    } else {
+        // Validate type
+        if obj.Type() != OBJ_STRING {
+            return resp.EncodeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
+
+        // Validate encoding
+        if obj.Encoding() != OBJ_ENCODING_INT {
+            return resp.EncodeError("ERR value is not an integer or out of range")
+        }
+
+        // Parse current value
+        var err error
+        currentValue, err = strconv.ParseInt(obj.value.(string), 10, 64)
+        if err != nil {
+            return resp.EncodeError("ERR value is not an integer or out of range")
+        }
+    }
+
+    // Increment
+    currentValue++
+
+    // Store back as string with INT encoding
+    newObj := &Object{
+        value:     strconv.FormatInt(currentValue, 10),
+        expiresAt: 0,
+    }
+    newObj.SetTypeEncoding(OBJ_STRING, OBJ_ENCODING_INT)
+
+    store[key] = newObj
+
+    // Return integer (not string)
+    return resp.EncodeInteger(currentValue)
+}
+```
+
+---
+
+#### Performance Considerations
+
+**String ↔ Integer Conversion Cost:**
+
+```go
+// Every INCR operation requires:
+1. ParseInt(string → int64)     // ~50-100 ns
+2. Increment (int64++)          // ~1 ns
+3. FormatInt(int64 → string)    // ~50-100 ns
+
+Total: ~100-200 ns per INCR
+```
+
+**Alternative: Store int64 directly in ptr**
+
+Redis creator (Antirez) acknowledged this overhead but chose simplicity:
+- **Pro**: Unified type system (all strings)
+- **Con**: Repeated conversions for numeric operations
+
+**Potential optimization** (GitHub issue):
+- Store integers directly as `int64` in `ptr` field
+- Avoid string conversions
+- **Estimated speedup**: 2-5× for numeric operations
+
+---
+
+### SET Command with Type Deduction
+
+```go
+func evalSET(args []string) []byte {
+    if len(args) < 2 {
+        return resp.EncodeError("ERR wrong number of arguments for 'SET' command")
+    }
+
+    key, value := args[0], args[1]
+
+    // Deduce optimal encoding
+    objType, encoding := deduceTypeEncoding(value)
+
+    obj := &Object{
+        value:     value,
+        expiresAt: 0,
+    }
+    obj.SetTypeEncoding(objType, encoding)
+
+    // Parse expiration options (EX, PX, etc.)
+    for i := 2; i < len(args); i++ {
+        option := strings.ToUpper(args[i])
+        switch option {
+        case "EX":  // Seconds
+            seconds, _ := strconv.ParseInt(args[i+1], 10, 64)
+            obj.expiresAt = time.Now().UnixMilli() + (seconds * 1000)
+            i++
+        case "PX":  // Milliseconds
+            ms, _ := strconv.ParseInt(args[i+1], 10, 64)
+            obj.expiresAt = time.Now().UnixMilli() + ms
+            i++
+        }
+    }
+
+    store[key] = obj
+    return resp.EncodeSimpleString("OK")
+}
+
+func deduceTypeEncoding(value string) (ObjectType, ObjectEncoding) {
+    // Try integer
+    if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+        return OBJ_STRING, OBJ_ENCODING_INT
+    }
+
+    // Try embedded string
+    if len(value) <= 44 {
+        return OBJ_STRING, OBJ_ENCODING_EMBSTR
+    }
+
+    // Default to raw
+    return OBJ_STRING, OBJ_ENCODING_RAW
+}
+```
+
+**Example:**
+```bash
+SET name "Alice"          # → OBJ_STRING + OBJ_ENCODING_EMBSTR (≤44 bytes)
+SET age "25"              # → OBJ_STRING + OBJ_ENCODING_INT (valid integer)
+SET bio "Long text..."    # → OBJ_STRING + OBJ_ENCODING_RAW (>44 bytes)
+```
+
+---
+
+### Extensibility: Adding New Data Structures
+
+The type/encoding split makes Redis highly extensible:
+
+**Example: Adding Bloom Filter**
+
+```go
+// Use existing type
+const OBJ_ENCODING_BLOOMFILTER ObjectEncoding = 9
+
+// Implement as byte array (similar to OBJ_ENCODING_RAW)
+func evalBFADD(args []string) []byte {
+    key, item := args[0], args[1]
+
+    obj, exists := store[key]
+    if !exists {
+        // Create new Bloom filter
+        bf := bloomfilter.New(10000, 5)  // 10k items, 5 hash functions
+
+        obj = &Object{
+            value: bf,
+        }
+        obj.SetTypeEncoding(OBJ_STRING, OBJ_ENCODING_BLOOMFILTER)
+        store[key] = obj
+    }
+
+    // Type check
+    if obj.Encoding() != OBJ_ENCODING_BLOOMFILTER {
+        return resp.EncodeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+    }
+
+    // Add to Bloom filter
+    bf := obj.value.(*bloomfilter.BloomFilter)
+    bf.Add(item)
+
+    return resp.EncodeInteger(1)
+}
+```
+
+**Benefits:**
+- No changes to core `redisObject` structure
+- Reuses existing infrastructure (expiration, LRU, refcount)
+- Easy to contribute new optimized encodings
+
+---
+
+### Summary
+
+**redisObject Design Principles:**
+1. ✅ **Unified Structure**: All values use same object wrapper
+2. ✅ **Type Abstraction**: Separate logical type from implementation
+3. ✅ **Encoding Polymorphism**: Multiple implementations per type
+4. ✅ **Memory Optimization**: Bitfields save 8 bytes per object
+5. ✅ **Dynamic Conversion**: Automatic encoding upgrades
+
+**Encoding Strategies:**
+
+| Encoding | Use Case | Memory | Performance |
+|----------|----------|--------|-------------|
+| `OBJ_ENCODING_INT` | Integer strings | Low | Fast (numeric ops) |
+| `OBJ_ENCODING_EMBSTR` | Small strings (≤44B) | Low | Fast (single alloc) |
+| `OBJ_ENCODING_RAW` | Large strings/binary | Medium | Moderate |
+| `OBJ_ENCODING_ZIPLIST` | Small collections | Very Low | Slow (linear scan) |
+| `OBJ_ENCODING_LINKEDLIST` | Large collections | High | Fast (O(1) ops) |
+
+**INCR Implementation:**
+1. ✅ Check key existence
+2. ✅ Validate type = OBJ_STRING
+3. ✅ Validate encoding = OBJ_ENCODING_INT
+4. ✅ Parse string to int64
+5. ✅ Increment
+6. ✅ Convert back to string
+7. ✅ Store with INT encoding
+
+**Trade-offs:**
+- ⚠️ String ↔ Integer conversion overhead (100-200ns)
+- ⚠️ Bitfields not available in Go (use manual bit manipulation)
+- ✅ Simplified type system (no dedicated int type)
+- ✅ Extensibility (easy to add new encodings)
+
+**Next:** INFO command and advanced eviction strategies
+
+---
+
